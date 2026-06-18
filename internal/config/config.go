@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -71,6 +72,7 @@ func getEnvIntOrDefault(key string, defaultVal int) int {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+		slog.Warn("invalid integer environment variable, using default", "key", key, "value", v, "default", defaultVal)
 	}
 	return defaultVal
 }

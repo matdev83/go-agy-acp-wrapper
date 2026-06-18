@@ -2,9 +2,14 @@ package acp
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/mateusz/go-agy-acp-wrapper/internal/agy"
 	"github.com/mateusz/go-agy-acp-wrapper/internal/config"
 )
 
@@ -56,11 +61,14 @@ func TestAgyAgent_CloseSession(t *testing.T) {
 	agent := NewAgyAgent(cfg)
 	defer agent.Close()
 
-	sessResp, _ := agent.NewSession(context.Background(), acp.NewSessionRequest{
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
 		Cwd: t.TempDir(),
 	})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
 
-	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{
+	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{
 		SessionId: sessResp.SessionId,
 	})
 	if err != nil {
@@ -87,11 +95,14 @@ func TestAgyAgent_Prompt_EmptyPrompt(t *testing.T) {
 	agent := NewAgyAgent(cfg)
 	defer agent.Close()
 
-	sessResp, _ := agent.NewSession(context.Background(), acp.NewSessionRequest{
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
 		Cwd: t.TempDir(),
 	})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
 
-	_, err := agent.Prompt(context.Background(), acp.PromptRequest{
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
 		SessionId: sessResp.SessionId,
 		Prompt:    []acp.ContentBlock{},
 	})
@@ -138,12 +149,12 @@ func TestExtractPromptText(t *testing.T) {
 			expected: "",
 		},
 		{
-			name: "multiple text blocks uses first",
+			name: "multiple text blocks joined",
 			blocks: []acp.ContentBlock{
 				acp.TextBlock("first"),
 				acp.TextBlock("second"),
 			},
-			expected: "first",
+			expected: "first\n\nsecond",
 		},
 	}
 
@@ -155,4 +166,43 @@ func TestExtractPromptText(t *testing.T) {
 			}
 		})
 	}
+}
+
+type stubRunner struct{}
+
+func (stubRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return &agy.Response{Output: "ok"}, nil
+}
+
+func TestAgyAgent_ExecuteFallbackTurn_DoesNotDuplicateCurrentPrompt(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	agent.runner = stubRunner{}
+
+	sess, err := agent.store.Create(t.TempDir())
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	sess.AddUserMessage("First question")
+	sess.AddAssistantMessage("First answer")
+	sess.AddUserMessage("Follow-up question")
+
+	_, err = agent.executeFallbackTurn(context.Background(), sess, agy.ExecuteOpts{}, "Follow-up question")
+	if err != nil {
+		t.Fatalf("executeFallbackTurn failed: %v", err)
+	}
+
+	path := agent.promptWriterTestContextPath(sess.ID, sess.GetTurnCount())
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading context dump: %v", err)
+	}
+	if count := strings.Count(string(data), "Follow-up question"); count != 1 {
+		t.Fatalf("expected current prompt once, got %d in %q", count, string(data))
+	}
+}
+
+func (a *AgyAgent) promptWriterTestContextPath(sessionID string, turnCount int) string {
+	return filepath.Join(a.cfg.TempDir, sessionID, fmt.Sprintf("context_%d.md", turnCount))
 }

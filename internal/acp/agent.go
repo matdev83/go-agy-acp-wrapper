@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,13 +18,13 @@ import (
 var _ acp.Agent = (*AgyAgent)(nil)
 
 type AgyAgent struct {
-	conn        *acp.AgentSideConnection
-	cfg         *config.Config
-	store       *session.Store
-	runner      agy.Runner
-	discoverer  *agy.ConversationDiscoverer
+	conn         *acp.AgentSideConnection
+	cfg          *config.Config
+	store        *session.Store
+	runner       agy.Runner
+	discoverer   *agy.ConversationDiscoverer
 	promptWriter *agy.PromptFileWriter
-	mu          sync.Mutex
+	mu           sync.Mutex
 }
 
 func NewAgyAgent(cfg *config.Config) *AgyAgent {
@@ -173,6 +174,9 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string) (string, error) {
 	transcript := sess.GetTranscript()
 	turnCount := sess.GetTurnCount()
+	if len(transcript) > 0 && transcript[len(transcript)-1].Role == session.RoleUser && transcript[len(transcript)-1].Content == promptText {
+		transcript = transcript[:len(transcript)-1]
+	}
 
 	contextPath, err := a.promptWriter.WriteContextDump(sess.ID, turnCount, transcript, promptText)
 	if err != nil {
@@ -338,6 +342,5 @@ func joinNonEmpty(parts []string) string {
 	if len(result) == 0 {
 		return ""
 	}
-	return result[0]
+	return strings.Join(result, "\n\n")
 }
-

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -146,20 +147,48 @@ func (r *NonInteractiveRunner) extractFromTranscript(conversationID string) stri
 	defer f.Close()
 
 	var lastResponse string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
+	reader := bufio.NewReader(f)
+	for {
+		line, err := readJSONLLine(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			slog.Warn("failed to read transcript", "conversationId", conversationID, "error", err)
+			return ""
+		}
+
 		var entry struct {
 			Type    string `json:"type"`
 			Content string `json:"content"`
 		}
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
+		if json.Unmarshal(line, &entry) == nil {
 			if entry.Type == "PLANNER_RESPONSE" && entry.Content != "" {
 				lastResponse = entry.Content
 			}
 		}
 	}
 	return lastResponse
+}
+
+func readJSONLLine(r io.ByteReader) ([]byte, error) {
+	var line []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			if err == io.EOF && len(line) > 0 {
+				return line, nil
+			}
+			return nil, err
+		}
+		if b == '\n' {
+			return line, nil
+		}
+		if b == '\r' {
+			continue
+		}
+		line = append(line, b)
+	}
 }
 
 func normalizeLineEndings(s string) string {

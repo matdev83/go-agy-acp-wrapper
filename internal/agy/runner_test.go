@@ -2,7 +2,11 @@ package agy
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,6 +155,46 @@ func TestNormalizeLineEndings(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("normalizeLineEndings(%q) = %q, want %q", tt.input, result, tt.expected)
 		}
+	}
+}
+
+func TestNonInteractiveRunner_ExtractFromTranscript_LargeResponse(t *testing.T) {
+	configDir := t.TempDir()
+	conversationID := "conv-large"
+	logDir := filepath.Join(configDir, "brain", conversationID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	largeResponse := strings.Repeat("x", 1024*1024+1)
+	transcript := fmt.Sprintf("{\"type\":\"PLANNER_RESPONSE\",\"content\":%q}\n", largeResponse)
+	if err := os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(transcript), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	r := NewNonInteractiveRunner("agy", configDir)
+	if got := r.extractFromTranscript(conversationID); got != largeResponse {
+		t.Fatalf("expected large response length %d, got %d", len(largeResponse), len(got))
+	}
+}
+
+func TestNonInteractiveRunner_ExtractFromTranscript_CRLF(t *testing.T) {
+	configDir := t.TempDir()
+	conversationID := "conv-crlf"
+	logDir := filepath.Join(configDir, "brain", conversationID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	transcript := "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"first\"}\r\n" +
+		"{\"type\":\"PLANNER_RESPONSE\",\"content\":\"second\"}\r\n"
+	if err := os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(transcript), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	r := NewNonInteractiveRunner("agy", configDir)
+	if got := r.extractFromTranscript(conversationID); got != "second" {
+		t.Fatalf("expected last response %q, got %q", "second", got)
 	}
 }
 
