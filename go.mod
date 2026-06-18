@@ -1,4 +1,4 @@
-module github.com/mateusz/go-agy-acp-wrapper
+module github.com/matdev83/go-agy-acp-wrapper
 
 go 1.25.0
 

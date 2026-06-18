@@ -6,8 +6,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/mateusz/go-agy-acp-wrapper/internal/acp"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/config"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/acp"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
 )
 
 func main() {

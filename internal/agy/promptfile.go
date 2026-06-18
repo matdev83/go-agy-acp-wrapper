@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/mateusz/go-agy-acp-wrapper/internal/session"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/session"
 )
 
 type PromptFileWriter struct {

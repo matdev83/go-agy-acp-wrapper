@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mateusz/go-agy-acp-wrapper/internal/session"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/session"
 )
 
 func TestPromptFileWriter_NeedsFile(t *testing.T) {

@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/agy"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/config"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/session"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/agy"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/session"
 )
 
 var _ acp.Agent = (*AgyAgent)(nil)

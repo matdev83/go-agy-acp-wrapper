@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/agy"
-	"github.com/mateusz/go-agy-acp-wrapper/internal/config"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/agy"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
 )
 
 func newTestConfig(t *testing.T) *config.Config {
