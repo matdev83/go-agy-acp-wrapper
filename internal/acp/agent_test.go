@@ -56,6 +56,152 @@ func TestAgyAgent_NewSession(t *testing.T) {
 	if resp.SessionId == "" {
 		t.Fatal("expected non-empty session ID")
 	}
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	if got := sess.GetModel(); got != defaultModel {
+		t.Fatalf("expected default model %q, got %q", defaultModel, got)
+	}
+}
+
+func TestAgyAgent_NewSession_InvalidConfiguredModelFallsBackToDefault(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.DefaultModel = "gemini-3.5-flash"
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+
+	resp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	if got := sess.GetModel(); got != defaultModel {
+		t.Fatalf("expected default model %q, got %q", defaultModel, got)
+	}
+}
+
+func TestAgyAgent_SetSessionConfigOption_InvalidModelFallsBackToDefault(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+
+	resp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	_, err = agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: resp.SessionId,
+			ConfigId:  acp.SessionConfigId(modelConfigID),
+			Value:     acp.SessionConfigValueId("gemini-3.5-flash"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("SetSessionConfigOption failed: %v", err)
+	}
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	if got := sess.GetModel(); got != defaultModel {
+		t.Fatalf("expected default model %q, got %q", defaultModel, got)
+	}
+}
+
+func TestNormalizeModel_AcceptsSlugsVendorPrefixesAndLabels(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"", defaultModel},
+		{"not-a-model", defaultModel},
+		{"gemini-3.5-flash-high", "google/gemini-3.5-flash-high"},
+		{"google/gemini-3.5-flash-medium", "google/gemini-3.5-flash-medium"},
+		{"gemini-3.5-flash-low", "google/gemini-3.5-flash-low"},
+		{"gemini-3.1-pro", "google/gemini-3.1-pro"},
+		{"gemini-3.1-pro-high", "google/gemini-3.1-pro"},
+		{"google/gemini-3.1-pro-high", "google/gemini-3.1-pro"},
+		{"claude-sonnet-4.6-thinking", "anthropic/claude-sonnet-4.6-thinking"},
+		{"claude-sonnet-4.6", "anthropic/claude-sonnet-4.6-thinking"},
+		{"google/claude-sonnet-4.6-thinking", "anthropic/claude-sonnet-4.6-thinking"},
+		{"anthropic/claude-sonnet-4.6", "anthropic/claude-sonnet-4.6-thinking"},
+		{"claude-opus-4.6-thinking", "anthropic/claude-opus-4.6-thinking"},
+		{"claude-opus-4.6", "anthropic/claude-opus-4.6-thinking"},
+		{"google/claude-opus-4.6-thinking", "anthropic/claude-opus-4.6-thinking"},
+		{"anthropic/claude-opus-4.6", "anthropic/claude-opus-4.6-thinking"},
+		{"Gemini 3.5 Flash (High)", "google/gemini-3.5-flash-high"},
+		{"Gemini 3.1 Pro (High)", "google/gemini-3.1-pro"},
+		{"Claude Sonnet 4.6 (Thinking)", "anthropic/claude-sonnet-4.6-thinking"},
+		{"Claude Opus 4.6 (Thinking)", "anthropic/claude-opus-4.6-thinking"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := normalizeModel(tt.input); got != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}
+
+func TestAgyModelLabel_ConvertsSlugToAgyLabel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"google/gemini-3.5-flash-high", "Gemini 3.5 Flash (High)"},
+		{"google/gemini-3.5-flash-medium", "Gemini 3.5 Flash (Medium)"},
+		{"gemini-3.5-flash-low", "Gemini 3.5 Flash (Low)"},
+		{"gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"},
+		{"anthropic/claude-sonnet-4.6-thinking", "Claude Sonnet 4.6 (Thinking)"},
+		{"claude-sonnet-4.6", "Claude Sonnet 4.6 (Thinking)"},
+		{"google/claude-opus-4.6-thinking", "Claude Opus 4.6 (Thinking)"},
+		{"claude-opus-4.6", "Claude Opus 4.6 (Thinking)"},
+		{"not-a-model", "Gemini 3.5 Flash (High)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := agyModelLabel(tt.input); got != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}
+
+func TestAgyAgent_BuildConfigOptions_ExposesModelSlugs(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	sess, err := agent.store.Create(t.TempDir())
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	sess.SetModel("Gemini 3.5 Flash (Medium)")
+
+	options := agent.buildConfigOptions(sess)
+	if len(options) != 1 || options[0].Select == nil {
+		t.Fatalf("expected one select config option, got %#v", options)
+	}
+	selectOption := options[0].Select
+	if selectOption.CurrentValue != "google/gemini-3.5-flash-medium" {
+		t.Fatalf("expected current value slug, got %q", selectOption.CurrentValue)
+	}
+	if selectOption.Options.Ungrouped == nil {
+		t.Fatal("expected ungrouped model options")
+	}
+	for _, option := range *selectOption.Options.Ungrouped {
+		if strings.Contains(string(option.Value), " ") {
+			t.Fatalf("expected slug value, got %q", option.Value)
+		}
+		if !strings.Contains(string(option.Value), "/") {
+			t.Fatalf("expected vendor-prefixed slug value, got %q", option.Value)
+		}
+	}
 }
 
 func TestAgyAgent_CloseSession(t *testing.T) {

@@ -77,9 +77,7 @@ func (a *AgyAgent) NewSession(ctx context.Context, params acp.NewSessionRequest)
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
 
-	if a.cfg.DefaultModel != "" {
-		sess.SetModel(a.cfg.DefaultModel)
-	}
+	sess.SetModel(normalizeModel(a.cfg.DefaultModel))
 
 	slog.Info("new session created", "sessionId", sess.ID, "cwd", params.Cwd, "model", sess.GetModel())
 
@@ -153,7 +151,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 
 	opts := agy.ExecuteOpts{
 		Cwd:       sess.Cwd,
-		Model:     sess.GetModel(),
+		Model:     agyModelLabel(sess.GetModel()),
 		Timeout:   time.Duration(a.cfg.TimeoutSeconds) * time.Second,
 		SkipPerms: a.cfg.SkipPerms,
 	}
@@ -284,11 +282,40 @@ func (a *AgyAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRe
 }
 
 const modelConfigID = "model"
+const defaultModel = "google/gemini-3.5-flash-high"
 
-var knownModels = []string{
-	"Gemini 3.5 Flash (High)",
-	"Gemini 3.5 Flash (Medium)",
-	"Gemini 3.1 Pro (High)",
+type modelOption struct {
+	Slug     string
+	Name     string
+	AgyLabel string
+}
+
+var knownModels = []modelOption{
+	{Slug: defaultModel, Name: "Gemini 3.5 Flash (High)", AgyLabel: "Gemini 3.5 Flash (High)"},
+	{Slug: "google/gemini-3.5-flash-medium", Name: "Gemini 3.5 Flash (Medium)", AgyLabel: "Gemini 3.5 Flash (Medium)"},
+	{Slug: "google/gemini-3.5-flash-low", Name: "Gemini 3.5 Flash (Low)", AgyLabel: "Gemini 3.5 Flash (Low)"},
+	{Slug: "google/gemini-3.1-pro", Name: "Gemini 3.1 Pro (High)", AgyLabel: "Gemini 3.1 Pro (High)"},
+	{Slug: "anthropic/claude-sonnet-4.6-thinking", Name: "Claude Sonnet 4.6 (Thinking)", AgyLabel: "Claude Sonnet 4.6 (Thinking)"},
+	{Slug: "anthropic/claude-opus-4.6-thinking", Name: "Claude Opus 4.6 (Thinking)", AgyLabel: "Claude Opus 4.6 (Thinking)"},
+}
+
+var modelAliases = map[string]string{
+	"gemini-3.5-flash-high":             "google/gemini-3.5-flash-high",
+	"gemini-3.5-flash-medium":           "google/gemini-3.5-flash-medium",
+	"gemini-3.5-flash-low":              "google/gemini-3.5-flash-low",
+	"gemini-3.1-pro":                    "google/gemini-3.1-pro",
+	"gemini-3.1-pro-high":               "google/gemini-3.1-pro",
+	"google/gemini-3.1-pro-high":        "google/gemini-3.1-pro",
+	"claude-sonnet-4.6-thinking":        "anthropic/claude-sonnet-4.6-thinking",
+	"claude-sonnet-4.6":                 "anthropic/claude-sonnet-4.6-thinking",
+	"claude-opus-4.6-thinking":          "anthropic/claude-opus-4.6-thinking",
+	"claude-opus-4.6":                   "anthropic/claude-opus-4.6-thinking",
+	"google/claude-sonnet-4.6-thinking": "anthropic/claude-sonnet-4.6-thinking",
+	"google/claude-sonnet-4.6":          "anthropic/claude-sonnet-4.6-thinking",
+	"google/claude-opus-4.6-thinking":   "anthropic/claude-opus-4.6-thinking",
+	"google/claude-opus-4.6":            "anthropic/claude-opus-4.6-thinking",
+	"anthropic/claude-sonnet-4.6":       "anthropic/claude-sonnet-4.6-thinking",
+	"anthropic/claude-opus-4.6":         "anthropic/claude-opus-4.6-thinking",
 }
 
 func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
@@ -306,7 +333,7 @@ func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSes
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("session %s not found", sid)
 	}
 
-	newModel := string(params.ValueId.Value)
+	newModel := normalizeModel(string(params.ValueId.Value))
 	sess.SetModel(newModel)
 	slog.Info("model changed", "sessionId", sid, "model", newModel)
 
@@ -316,16 +343,13 @@ func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSes
 }
 
 func (a *AgyAgent) buildConfigOptions(sess *session.Context) []acp.SessionConfigOption {
-	currentModel := sess.GetModel()
-	if currentModel == "" {
-		currentModel = "(default)"
-	}
+	currentModel := normalizeModel(sess.GetModel())
 
 	options := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(knownModels))
-	for _, m := range knownModels {
+	for _, model := range knownModels {
 		options = append(options, acp.SessionConfigSelectOption{
-			Value: acp.SessionConfigValueId(m),
-			Name:  m,
+			Value: acp.SessionConfigValueId(model.Slug),
+			Name:  model.Name,
 		})
 	}
 
@@ -344,6 +368,28 @@ func (a *AgyAgent) buildConfigOptions(sess *session.Context) []acp.SessionConfig
 			},
 		},
 	}
+}
+
+func normalizeModel(model string) string {
+	if alias, ok := modelAliases[model]; ok {
+		return alias
+	}
+	for _, known := range knownModels {
+		if model == known.Slug || model == known.AgyLabel || model == known.Name {
+			return known.Slug
+		}
+	}
+	return defaultModel
+}
+
+func agyModelLabel(model string) string {
+	model = normalizeModel(model)
+	for _, known := range knownModels {
+		if model == known.Slug {
+			return known.AgyLabel
+		}
+	}
+	return agyModelLabel(defaultModel)
 }
 
 func (a *AgyAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
