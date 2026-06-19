@@ -286,10 +286,9 @@ func (a *AgyAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRe
 const modelConfigID = "model"
 
 var knownModels = []string{
-	"gemini-2.5-pro",
-	"gemini-2.5-flash",
+	"Gemini 3.5 Flash (High)",
+	"Gemini 3.5 Flash (Medium)",
 	"Gemini 3.1 Pro (High)",
-	"Gemini 3.1 Flash",
 }
 
 func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
