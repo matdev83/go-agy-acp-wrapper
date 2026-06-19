@@ -10,13 +10,13 @@ import (
 )
 
 type PromptFileWriter struct {
-	baseDir   string
 	threshold int
 }
 
-func NewPromptFileWriter(baseDir string, threshold int) *PromptFileWriter {
+const PromptFileDirName = ".go-agy-acp-wrapper"
+
+func NewPromptFileWriter(threshold int) *PromptFileWriter {
 	return &PromptFileWriter{
-		baseDir:   baseDir,
 		threshold: threshold,
 	}
 }
@@ -25,8 +25,11 @@ func (w *PromptFileWriter) NeedsFile(prompt string) bool {
 	return len(prompt) > w.threshold
 }
 
-func (w *PromptFileWriter) WritePromptFile(sessionID string, turnCount int, prompt string) (string, error) {
-	dir := filepath.Join(w.baseDir, sessionID)
+func (w *PromptFileWriter) WritePromptFile(cwd, sessionID string, turnCount int, prompt string) (string, error) {
+	dir, err := w.sessionDir(cwd, sessionID)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create prompt dir: %w", err)
 	}
@@ -38,8 +41,11 @@ func (w *PromptFileWriter) WritePromptFile(sessionID string, turnCount int, prom
 	return filename, nil
 }
 
-func (w *PromptFileWriter) WriteContextDump(sessionID string, turnCount int, transcript []session.Message, newPrompt string) (string, error) {
-	dir := filepath.Join(w.baseDir, sessionID)
+func (w *PromptFileWriter) WriteContextDump(cwd, sessionID string, turnCount int, transcript []session.Message, newPrompt string) (string, error) {
+	dir, err := w.sessionDir(cwd, sessionID)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create context dir: %w", err)
 	}
@@ -72,11 +78,33 @@ func (w *PromptFileWriter) WriteContextDump(sessionID string, turnCount int, tra
 	return filename, nil
 }
 
-func (w *PromptFileWriter) CleanupSession(sessionID string) error {
-	dir := filepath.Join(w.baseDir, sessionID)
+func (w *PromptFileWriter) CleanupSession(cwd, sessionID string) error {
+	dir, err := w.sessionDir(cwd, sessionID)
+	if err != nil {
+		return err
+	}
 	return os.RemoveAll(dir)
 }
 
-func (w *PromptFileWriter) CleanupAll() error {
-	return os.RemoveAll(w.baseDir)
+func (w *PromptFileWriter) CleanupWorkdir(cwd string) error {
+	dir, err := w.workdirDir(cwd)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
+func (w *PromptFileWriter) sessionDir(cwd, sessionID string) (string, error) {
+	dir, err := w.workdirDir(cwd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, sessionID), nil
+}
+
+func (w *PromptFileWriter) workdirDir(cwd string) (string, error) {
+	if cwd == "" {
+		return "", fmt.Errorf("cwd is required")
+	}
+	return filepath.Join(cwd, PromptFileDirName), nil
 }

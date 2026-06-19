@@ -10,7 +10,7 @@ import (
 )
 
 func TestPromptFileWriter_NeedsFile(t *testing.T) {
-	w := NewPromptFileWriter(t.TempDir(), 100)
+	w := NewPromptFileWriter(100)
 
 	short := strings.Repeat("a", 50)
 	if w.NeedsFile(short) {
@@ -24,15 +24,15 @@ func TestPromptFileWriter_NeedsFile(t *testing.T) {
 }
 
 func TestPromptFileWriter_WritePromptFile(t *testing.T) {
-	base := t.TempDir()
-	w := NewPromptFileWriter(base, 100)
+	cwd := t.TempDir()
+	w := NewPromptFileWriter(100)
 
-	path, err := w.WritePromptFile("sess_abc", 1, "hello world prompt")
+	path, err := w.WritePromptFile(cwd, "sess_abc", 1, "hello world prompt")
 	if err != nil {
 		t.Fatalf("WritePromptFile failed: %v", err)
 	}
 
-	expectedDir := filepath.Join(base, "sess_abc")
+	expectedDir := filepath.Join(cwd, PromptFileDirName, "sess_abc")
 	if !strings.HasPrefix(path, expectedDir) {
 		t.Fatalf("expected path under %s, got %s", expectedDir, path)
 	}
@@ -47,15 +47,15 @@ func TestPromptFileWriter_WritePromptFile(t *testing.T) {
 }
 
 func TestPromptFileWriter_WriteContextDump(t *testing.T) {
-	base := t.TempDir()
-	w := NewPromptFileWriter(base, 100)
+	cwd := t.TempDir()
+	w := NewPromptFileWriter(100)
 
 	transcript := []session.Message{
 		{Role: session.RoleUser, Content: "First question"},
 		{Role: session.RoleAssistant, Content: "First answer"},
 	}
 
-	path, err := w.WriteContextDump("sess_xyz", 2, transcript, "Follow-up question")
+	path, err := w.WriteContextDump(cwd, "sess_xyz", 2, transcript, "Follow-up question")
 	if err != nil {
 		t.Fatalf("WriteContextDump failed: %v", err)
 	}
@@ -81,24 +81,47 @@ func TestPromptFileWriter_WriteContextDump(t *testing.T) {
 }
 
 func TestPromptFileWriter_CleanupSession(t *testing.T) {
-	base := t.TempDir()
-	w := NewPromptFileWriter(base, 100)
+	cwd := t.TempDir()
+	w := NewPromptFileWriter(100)
 
-	_, err := w.WritePromptFile("sess_cleanup", 1, "test content")
+	_, err := w.WritePromptFile(cwd, "sess_cleanup", 1, "test content")
 	if err != nil {
 		t.Fatalf("WritePromptFile failed: %v", err)
 	}
 
-	dir := filepath.Join(base, "sess_cleanup")
+	dir := filepath.Join(cwd, PromptFileDirName, "sess_cleanup")
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("session dir should exist: %v", err)
 	}
 
-	if err := w.CleanupSession("sess_cleanup"); err != nil {
+	if err := w.CleanupSession(cwd, "sess_cleanup"); err != nil {
 		t.Fatalf("CleanupSession failed: %v", err)
 	}
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("expected session dir to be removed")
+	}
+}
+
+func TestPromptFileWriter_CleanupWorkdir(t *testing.T) {
+	cwd := t.TempDir()
+	w := NewPromptFileWriter(100)
+
+	_, err := w.WritePromptFile(cwd, "sess_cleanup", 1, "test content")
+	if err != nil {
+		t.Fatalf("WritePromptFile failed: %v", err)
+	}
+
+	dir := filepath.Join(cwd, PromptFileDirName)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("workdir temp dir should exist: %v", err)
+	}
+
+	if err := w.CleanupWorkdir(cwd); err != nil {
+		t.Fatalf("CleanupWorkdir failed: %v", err)
+	}
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("expected workdir temp dir to be removed")
 	}
 }
