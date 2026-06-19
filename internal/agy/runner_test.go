@@ -1,8 +1,10 @@
 package agy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -139,6 +141,187 @@ func TestNonInteractiveRunner_Execute_ContextCancelled(t *testing.T) {
 	}
 }
 
+func TestNonInteractiveRunner_ExecuteStream_EmitsStdoutBeforeProcessExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based timing test is Unix-only")
+	}
+
+	script := filepath.Join(t.TempDir(), "stream.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'first\\n'\nsleep 1\nprintf 'second\\n'\n"), 0700); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	r := NewNonInteractiveRunner(script, t.TempDir())
+	firstChunk := make(chan string, 1)
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(done)
+		_, err := r.ExecuteStream(context.Background(), ExecuteOpts{
+			Cwd:    t.TempDir(),
+			Prompt: "ignored",
+		}, func(chunk string) {
+			select {
+			case firstChunk <- chunk:
+			default:
+			}
+		})
+		if err != nil {
+			t.Errorf("ExecuteStream failed: %v", err)
+		}
+	}()
+
+	select {
+	case chunk := <-firstChunk:
+		if chunk != "first\n" {
+			t.Fatalf("expected first chunk, got %q", chunk)
+		}
+		if elapsed := time.Since(started); elapsed >= 900*time.Millisecond {
+			t.Fatalf("first chunk arrived too late: %s", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected stdout chunk before process exit")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("process did not finish")
+	}
+}
+
+func TestStreamPipeLines_EmitsPartialFinalLine(t *testing.T) {
+	var dst bytes.Buffer
+	var chunks []string
+	streamPipeLines(strings.NewReader("partial"), &dst, func(chunk string) {
+		chunks = append(chunks, chunk)
+	})
+	if dst.String() != "partial" {
+		t.Fatalf("expected dst partial, got %q", dst.String())
+	}
+	if len(chunks) != 1 || chunks[0] != "partial" {
+		t.Fatalf("expected one partial chunk, got %#v", chunks)
+	}
+}
+
+func TestStreamPipeLines_EmitsLineBeforePipeClose(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+
+	var dst bytes.Buffer
+	chunks := make(chan string, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamPipeLines(reader, &dst, func(chunk string) {
+			chunks <- chunk
+		})
+	}()
+
+	if _, err := writer.Write([]byte("first\n")); err != nil {
+		t.Fatalf("write first line: %v", err)
+	}
+
+	select {
+	case chunk := <-chunks:
+		if chunk != "first\n" {
+			t.Fatalf("expected first chunk, got %q", chunk)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected first line before second write or pipe close")
+	}
+
+	if _, err := writer.Write([]byte("second\n")); err != nil {
+		t.Fatalf("write second line: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("streamPipeLines did not return after pipe close")
+	}
+	if dst.String() != "first\nsecond\n" {
+		t.Fatalf("expected accumulated output, got %q", dst.String())
+	}
+}
+
+func TestTranscriptTailer_EmitsOnlyGrowingPlannerSuffix(t *testing.T) {
+	configDir := t.TempDir()
+	conversationID := "conv-tail"
+	path := makeTranscriptPath(t, configDir, conversationID)
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var chunks []string
+	tailer := newTranscriptTailer(configDir, conversationID, time.Now(), func(chunk string) {
+		chunks = append(chunks, chunk)
+	})
+	tailer.snapshotExisting()
+
+	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"first"}`+"\n")
+	tailer.scan()
+	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"first second"}`+"\n")
+	tailer.scan()
+
+	if got := strings.Join(chunks, ""); got != "first second" {
+		t.Fatalf("expected chunks to reconstruct content, got %q from %#v", got, chunks)
+	}
+	if len(chunks) != 2 || chunks[0] != "first" || chunks[1] != " second" {
+		t.Fatalf("expected suffix chunks, got %#v", chunks)
+	}
+	if got := tailer.output(); got != "first second" {
+		t.Fatalf("expected final output, got %q", got)
+	}
+}
+
+func TestTranscriptTailer_IgnoresPartialJSONLLineUntilComplete(t *testing.T) {
+	configDir := t.TempDir()
+	conversationID := "conv-partial"
+	path := makeTranscriptPath(t, configDir, conversationID)
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var chunks []string
+	tailer := newTranscriptTailer(configDir, conversationID, time.Now(), func(chunk string) {
+		chunks = append(chunks, chunk)
+	})
+	tailer.snapshotExisting()
+
+	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"partial"}`)
+	tailer.scan()
+	if len(chunks) != 0 {
+		t.Fatalf("expected no chunks for partial line, got %#v", chunks)
+	}
+
+	appendTranscript(t, path, "\n")
+	tailer.scan()
+	if len(chunks) != 1 || chunks[0] != "partial" {
+		t.Fatalf("expected completed line chunk, got %#v", chunks)
+	}
+}
+
+func TestTranscriptTailer_DiscoversNewTranscriptWithoutConversationID(t *testing.T) {
+	configDir := t.TempDir()
+	var chunks []string
+	tailer := newTranscriptTailer(configDir, "", time.Now(), func(chunk string) {
+		chunks = append(chunks, chunk)
+	})
+	tailer.snapshotExisting()
+
+	path := makeTranscriptPath(t, configDir, "conv-discovered")
+	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"discovered"}`+"\n")
+	tailer.scan()
+
+	if len(chunks) != 1 || chunks[0] != "discovered" {
+		t.Fatalf("expected discovered transcript chunk, got %#v", chunks)
+	}
+}
+
 func TestNormalizeLineEndings(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -207,5 +390,26 @@ func assertArgs(t *testing.T, expected, actual []string) {
 		if expected[i] != actual[i] {
 			t.Fatalf("arg[%d] mismatch: expected %q, got %q", i, expected[i], actual[i])
 		}
+	}
+}
+
+func makeTranscriptPath(t *testing.T, configDir, conversationID string) string {
+	t.Helper()
+	logDir := filepath.Join(configDir, "brain", conversationID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	return filepath.Join(logDir, "transcript.jsonl")
+}
+
+func appendTranscript(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("WriteString failed: %v", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -25,6 +26,13 @@ type AgyAgent struct {
 	discoverer   *agy.ConversationDiscoverer
 	promptWriter *agy.PromptFileWriter
 	mu           sync.Mutex
+	workdirs     map[string]int
+	cancels      map[string]activePrompt
+}
+
+type activePrompt struct {
+	token  *struct{}
+	cancel context.CancelFunc
 }
 
 func NewAgyAgent(cfg *config.Config) *AgyAgent {
@@ -33,7 +41,9 @@ func NewAgyAgent(cfg *config.Config) *AgyAgent {
 		store:        session.NewStore(),
 		runner:       agy.NewNonInteractiveRunner(cfg.AgyBinary, cfg.AgyConfigDir()),
 		discoverer:   agy.NewConversationDiscoverer(cfg.AgyConfigDir()),
-		promptWriter: agy.NewPromptFileWriter(cfg.TempDir, cfg.PromptThreshold),
+		promptWriter: agy.NewPromptFileWriter(cfg.PromptThreshold),
+		workdirs:     make(map[string]int),
+		cancels:      make(map[string]activePrompt),
 	}
 }
 
@@ -59,8 +69,11 @@ func (a *AgyAgent) Authenticate(ctx context.Context, params acp.AuthenticateRequ
 }
 
 func (a *AgyAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	a.registerWorkdir(params.Cwd)
+
 	sess, err := a.store.Create(params.Cwd)
 	if err != nil {
+		a.unregisterWorkdir(params.Cwd)
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
 
@@ -89,11 +102,31 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		return acp.PromptResponse{}, fmt.Errorf("empty prompt")
 	}
 
+	promptCtx, cancel := context.WithCancel(ctx)
+	token, ok := a.startPrompt(sid, cancel)
+	if !ok {
+		cancel()
+		return acp.PromptResponse{}, fmt.Errorf("session %s already has an active prompt", sid)
+	}
+	defer a.finishPrompt(sid, token)
+
 	sess.AddUserMessage(promptText)
 
-	response, err := a.executeTurn(ctx, sess, promptText)
+	var streamed atomic.Bool
+	response, err := a.executeTurn(promptCtx, sess, promptText, func(chunk string) {
+		if chunk == "" {
+			return
+		}
+		streamed.Store(true)
+		if err := a.conn.SessionUpdate(promptCtx, acp.SessionNotification{
+			SessionId: params.SessionId,
+			Update:    acp.UpdateAgentMessageText(chunk),
+		}); err != nil {
+			slog.Warn("send streamed session update failed", "sessionId", sid, "error", err)
+		}
+	})
 	if err != nil {
-		if ctx.Err() == context.Canceled {
+		if promptCtx.Err() == context.Canceled {
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 		}
 		return acp.PromptResponse{}, err
@@ -101,17 +134,19 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 
 	sess.AddAssistantMessage(response)
 
-	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
-		SessionId: params.SessionId,
-		Update:    acp.UpdateAgentMessageText(response),
-	}); err != nil {
-		return acp.PromptResponse{}, fmt.Errorf("send session update: %w", err)
+	if !streamed.Load() && response != "" {
+		if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+			SessionId: params.SessionId,
+			Update:    acp.UpdateAgentMessageText(response),
+		}); err != nil {
+			return acp.PromptResponse{}, fmt.Errorf("send session update: %w", err)
+		}
 	}
 
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
-func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promptText string) (string, error) {
+func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promptText string, onStdout func(string)) (string, error) {
 	mode := sess.GetMode()
 	convID := sess.GetConversationID()
 	turnCount := sess.GetTurnCount()
@@ -120,18 +155,18 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		Cwd:       sess.Cwd,
 		Model:     sess.GetModel(),
 		Timeout:   time.Duration(a.cfg.TimeoutSeconds) * time.Second,
-		SkipPerms: true,
+		SkipPerms: a.cfg.SkipPerms,
 	}
 
 	switch {
 	case mode == session.ModeFallbackContext:
-		return a.executeFallbackTurn(ctx, sess, opts, promptText)
+		return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
 
 	case convID != "" && turnCount > 1:
 		opts.ConversationID = convID
 		opts.Prompt = promptText
 		if a.promptWriter.NeedsFile(promptText) {
-			path, err := a.promptWriter.WritePromptFile(sess.ID, turnCount, promptText)
+			path, err := a.promptWriter.WritePromptFile(sess.Cwd, sess.ID, turnCount, promptText)
 			if err != nil {
 				return "", fmt.Errorf("write prompt file: %w", err)
 			}
@@ -139,18 +174,18 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			opts.Prompt = ""
 		}
 
-		resp, err := a.runner.Execute(ctx, opts)
+		resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
 		if err != nil {
 			slog.Warn("native conversation failed, switching to fallback", "error", err, "sessionId", sess.ID)
 			sess.SwitchToFallback()
-			return a.executeFallbackTurn(ctx, sess, opts, promptText)
+			return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
 		}
 		return resp.Output, nil
 
 	default:
 		opts.Prompt = promptText
 		if a.promptWriter.NeedsFile(promptText) {
-			path, err := a.promptWriter.WritePromptFile(sess.ID, turnCount, promptText)
+			path, err := a.promptWriter.WritePromptFile(sess.Cwd, sess.ID, turnCount, promptText)
 			if err != nil {
 				return "", fmt.Errorf("write prompt file: %w", err)
 			}
@@ -158,7 +193,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			opts.Prompt = ""
 		}
 
-		resp, err := a.runner.Execute(ctx, opts)
+		resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
 		if err != nil {
 			return "", err
 		}
@@ -171,14 +206,14 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 	}
 }
 
-func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string) (string, error) {
+func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string, onStdout func(string)) (string, error) {
 	transcript := sess.GetTranscript()
 	turnCount := sess.GetTurnCount()
 	if len(transcript) > 0 && transcript[len(transcript)-1].Role == session.RoleUser && transcript[len(transcript)-1].Content == promptText {
 		transcript = transcript[:len(transcript)-1]
 	}
 
-	contextPath, err := a.promptWriter.WriteContextDump(sess.ID, turnCount, transcript, promptText)
+	contextPath, err := a.promptWriter.WriteContextDump(sess.Cwd, sess.ID, turnCount, transcript, promptText)
 	if err != nil {
 		return "", fmt.Errorf("write context dump: %w", err)
 	}
@@ -187,7 +222,7 @@ func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Contex
 	opts.Prompt = ""
 	opts.PromptFilePath = contextPath
 
-	resp, err := a.runner.Execute(ctx, opts)
+	resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
 	if err != nil {
 		return "", err
 	}
@@ -209,14 +244,29 @@ func (a *AgyAgent) discoverAndSetConversationID(sess *session.Context) {
 }
 
 func (a *AgyAgent) Cancel(ctx context.Context, params acp.CancelNotification) error {
-	slog.Info("cancel received", "sessionId", string(params.SessionId))
+	sid := string(params.SessionId)
+	if cancel := a.cancelPrompt(sid); cancel != nil {
+		cancel()
+		slog.Info("cancelled active prompt", "sessionId", sid)
+		return nil
+	}
+	slog.Info("cancel received with no active prompt", "sessionId", sid)
 	return nil
 }
 
 func (a *AgyAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	sid := string(params.SessionId)
+	if cancel := a.cancelPrompt(sid); cancel != nil {
+		cancel()
+	}
+	sess, ok := a.store.Get(sid)
 	a.store.Delete(sid)
-	_ = a.promptWriter.CleanupSession(sid)
+	if ok {
+		_ = a.promptWriter.CleanupSession(sess.Cwd, sid)
+		if a.unregisterWorkdir(sess.Cwd) {
+			_ = a.promptWriter.CleanupWorkdir(sess.Cwd)
+		}
+	}
 	slog.Info("session closed", "sessionId", sid)
 	return acp.CloseSessionResponse{}, nil
 }
@@ -302,8 +352,90 @@ func (a *AgyAgent) SetSessionMode(ctx context.Context, params acp.SetSessionMode
 }
 
 func (a *AgyAgent) Close() {
+	cancels := a.closePrompts()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	workdirs := a.closeWorkdirs()
+	for _, cwd := range workdirs {
+		_ = a.promptWriter.CleanupWorkdir(cwd)
+	}
 	a.store.CloseAll()
-	_ = a.promptWriter.CleanupAll()
+}
+
+func (a *AgyAgent) startPrompt(sessionID string, cancel context.CancelFunc) (*struct{}, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, ok := a.cancels[sessionID]; ok {
+		return nil, false
+	}
+	token := &struct{}{}
+	a.cancels[sessionID] = activePrompt{token: token, cancel: cancel}
+	return token, true
+}
+
+func (a *AgyAgent) finishPrompt(sessionID string, token *struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if current, ok := a.cancels[sessionID]; ok && current.token == token {
+		delete(a.cancels, sessionID)
+	}
+}
+
+func (a *AgyAgent) cancelPrompt(sessionID string) context.CancelFunc {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	prompt, ok := a.cancels[sessionID]
+	if !ok {
+		return nil
+	}
+	return prompt.cancel
+}
+
+func (a *AgyAgent) closePrompts() []context.CancelFunc {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cancels := make([]context.CancelFunc, 0, len(a.cancels))
+	for _, prompt := range a.cancels {
+		cancels = append(cancels, prompt.cancel)
+	}
+	a.cancels = make(map[string]activePrompt)
+	return cancels
+}
+
+func (a *AgyAgent) registerWorkdir(cwd string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.workdirs[cwd]++
+}
+
+func (a *AgyAgent) unregisterWorkdir(cwd string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.workdirs[cwd] <= 1 {
+		delete(a.workdirs, cwd)
+		return true
+	}
+	a.workdirs[cwd]--
+	return false
+}
+
+func (a *AgyAgent) closeWorkdirs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	workdirs := make([]string, 0, len(a.workdirs))
+	for cwd := range a.workdirs {
+		workdirs = append(workdirs, cwd)
+	}
+	a.workdirs = make(map[string]int)
+	return workdirs
 }
 
 func Serve(ctx context.Context, cfg *config.Config, input io.Reader, output io.Writer) error {
