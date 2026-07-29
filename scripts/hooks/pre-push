@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+checker="$repo_root/scripts/check-release-clean.sh"
+zero="0000000000000000000000000000000000000000"
+commits=()
+
+add_commit() {
+	local candidate="$1"
+	local existing
+	for existing in "${commits[@]}"; do
+		[[ "$existing" == "$candidate" ]] && return
+	done
+	commits+=("$candidate")
+}
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+	[[ "$local_sha" == "$zero" ]] && continue
+
+	if [[ "$remote_sha" == "$zero" ]]; then
+		# On a new branch, inspect commits not already reachable from a remote ref.
+		while read -r commit; do
+			add_commit "$commit"
+		done < <(git rev-list --reverse "$local_sha" --not --remotes)
+	else
+		while read -r commit; do
+			add_commit "$commit"
+		done < <(git rev-list --reverse "$remote_sha..$local_sha")
+	fi
+done
+
+for commit in "${commits[@]}"; do
+	"$checker" --ref "$commit"
+done

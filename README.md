@@ -202,6 +202,25 @@ $env:WRAPPER_BIN = ".\bin\go-agy-acp-wrapper.exe"
 go test ./... -v
 ```
 
+## Repository File Policy
+
+Every file permitted in a commit is listed explicitly in `.release-files`. Add a
+new entry there in the same commit as any legitimate new source, test, workflow,
+or documentation file. Files not in the manifest are rejected regardless of
+their name, extension, or directory.
+
+Install the versioned pre-commit and pre-push hooks:
+
+```bash
+bash scripts/setup-hooks.sh
+```
+
+The pre-commit hook checks the complete staged tree, and the pre-push hook checks
+every commit being sent. CI repeats the commit-by-commit check on every branch
+push and pull request. To prevent bypasses from entering `main`, configure the
+GitHub branch ruleset to require pull requests and the `Repo hygiene` status
+check, and disable direct-push bypasses.
+
 ## Project Structure
 
 ```

@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -13,6 +12,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repo-hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Check repository file manifest
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="$BASE_SHA..HEAD"
+          elif [[ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            range="$BEFORE_SHA..HEAD"
+          else
+            git fetch --no-tags origin "$DEFAULT_BRANCH"
+            range="$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)..HEAD"
+          fi
+
+          while read -r commit; do
+            bash scripts/check-release-clean.sh --ref "$commit"
+          done < <(git rev-list --reverse "$range")
+
+          # Also covers branch creations or PRs with an empty calculated range.
+          bash scripts/check-release-clean.sh --ref HEAD
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -22,10 +54,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true

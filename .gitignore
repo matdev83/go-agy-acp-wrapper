@@ -1,5 +1,21 @@
 bin/
 dist/
+
+# Ignore stray files in repo root; only the allowlist in
+# scripts/check-release-clean.sh may be tracked there.
+/*
+!/.coderabbit.yaml
+!/.github/
+!/cmd/
+!/internal/
+!/scripts/
+!/.gitignore
+!/.goreleaser.yaml
+!/.release-files
+!/README.md
+!/SECURITY.md
+!/go.mod
+!/go.sum
 *.exe
 *.exe~
 *.dll
@@ -7,3 +23,8 @@ dist/
 *.dylib
 *.test
 *.out
+*.tmp
+*.log
+.env
+.pi-subagents/
+.pi/
