@@ -54,6 +54,15 @@ When `agy --print` produces no stdout (a known platform-specific issue), the
 wrapper extracts the model's response directly from agy's transcript log at
 `~/.gemini/antigravity-cli/brain/<UUID>/.system_generated/logs/transcript.jsonl`.
 
+## Installation
+
+Prebuilt archives for Windows, Linux, and macOS (`amd64` and `arm64`) are
+available from [GitHub Releases](https://github.com/matdev83/go-agy-acp-wrapper/releases).
+Each release includes a `checksums.txt` file with SHA-256 checksums.
+
+Download the archive for your platform, extract `go-agy-acp-wrapper` (or
+`go-agy-acp-wrapper.exe` on Windows), and place it on your `PATH`.
+
 ## Prerequisites
 
 - **agy** installed and authenticated

@@ -11,7 +11,7 @@ import (
 	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
 )
 
-const version = "dev"
+var version = "dev"
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
