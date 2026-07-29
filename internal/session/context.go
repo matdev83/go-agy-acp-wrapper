@@ -28,14 +28,15 @@ const (
 type Context struct {
 	mu sync.Mutex
 
-	ID             string
-	Cwd            string
-	ConversationID string
-	Model          string
-	Mode           Mode
-	Transcript     []Message
-	TurnCount      int
-	closed         bool
+	ID              string
+	Cwd             string
+	ConversationID  string
+	Model           string
+	ReasoningEffort string
+	Mode            Mode
+	Transcript      []Message
+	TurnCount       int
+	closed          bool
 }
 
 func NewContext(id, cwd string) *Context {
@@ -90,6 +91,18 @@ func (c *Context) GetModel() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.Model
+}
+
+func (c *Context) SetReasoningEffort(effort string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ReasoningEffort = effort
+}
+
+func (c *Context) GetReasoningEffort() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ReasoningEffort
 }
 
 func (c *Context) SwitchToFallback() {

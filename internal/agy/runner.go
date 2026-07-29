@@ -82,6 +82,7 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 
 	cmd := exec.CommandContext(execCtx, r.binary, args...)
 	cmd.Dir = opts.Cwd
+	cmd.Env = r.commandEnv()
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -360,6 +361,24 @@ func readCompleteJSONLFrom(path string, offset int64) ([]byte, int64, error) {
 
 func transcriptPath(configDir, conversationID string) string {
 	return filepath.Join(configDir, "brain", conversationID, ".system_generated", "logs", "transcript.jsonl")
+}
+
+func (r *NonInteractiveRunner) commandEnv() []string {
+	env := os.Environ()
+	if r.configDir == "" {
+		return env
+	}
+	home := filepath.Dir(filepath.Dir(r.configDir))
+	if home == "." || home == string(filepath.Separator) {
+		return env
+	}
+	if os.Getenv("HOME") == "" {
+		env = append(env, "HOME="+home)
+	}
+	if os.Getenv("USERPROFILE") == "" {
+		env = append(env, "USERPROFILE="+home)
+	}
+	return env
 }
 
 func (r *NonInteractiveRunner) buildArgs(opts ExecuteOpts) []string {

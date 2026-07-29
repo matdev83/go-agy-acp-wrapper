@@ -104,7 +104,7 @@ Use `go-agy-acp-wrapper --version` for executable validation without starting AC
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `AGY_BINARY` | `agy.exe` (Windows) / `agy` (Linux) | Path to the agy binary |
-| `AGY_MODEL` | _(empty = agy default)_ | Default model for new sessions (e.g. `gemini-2.5-flash`, `Gemini 3.1 Pro (High)`) |
+| `AGY_MODEL` | _(empty = catalog default)_ | Default model for new sessions (e.g. `gemini-3.6-flash-high`) |
 | `AGY_PROMPT_THRESHOLD` | `8000` | Byte threshold above which prompts are written to temp files |
 | `AGY_TIMEOUT_SECONDS` | `300` | Per-turn execution timeout in seconds |
 | `AGY_SKIP_PERMISSIONS` | `true` | Whether to pass `--dangerously-skip-permissions` to `agy`; set to `false` to opt out |
@@ -123,6 +123,12 @@ Equivalent CLI flags are available and override environment values:
 
 ### Model Selection
 
+Models are discovered automatically from `agy models` when the wrapper starts
+(during ACP `initialize`, cached for the process lifetime). Native effort variants
+are normalized into canonical provider/model identities. For example,
+`gemini-3.6-flash-{low,medium,high}` is advertised as `google/gemini-3.6-flash`.
+The separate ACP `reasoning_effort` session option selects the native agy variant.
+
 The model can be configured at multiple levels:
 
 1. **Environment variable**: Set `AGY_MODEL` to apply a default to all new sessions
@@ -137,10 +143,15 @@ with category `"model"`. Clients can switch models by calling `session/set_confi
   "params": {
     "configId": "model",
     "sessionId": "sess_abc123",
-    "value": "gemini-2.5-flash"
+    "value": "google/gemini-3.6-flash"
   }
 }
 ```
+
+Unknown model values and unsupported reasoning efforts return an error from
+`session/set_config_option`. If `AGY_MODEL` is set to an unknown value, the wrapper
+logs a warning and falls back to the catalog default (preferring
+`google/gemini-3.6-flash`, then `google/gemini-3.5-flash`).
 
 ## Supported ACP Methods
 

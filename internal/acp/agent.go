@@ -24,6 +24,7 @@ type AgyAgent struct {
 	store        *session.Store
 	runner       agy.Runner
 	discoverer   *agy.ConversationDiscoverer
+	modelCatalog *agy.ModelCatalog
 	promptWriter *agy.PromptFileWriter
 	mu           sync.Mutex
 	workdirs     map[string]int
@@ -41,6 +42,7 @@ func NewAgyAgent(cfg *config.Config) *AgyAgent {
 		store:        session.NewStore(),
 		runner:       agy.NewNonInteractiveRunner(cfg.AgyBinary, cfg.AgyConfigDir()),
 		discoverer:   agy.NewConversationDiscoverer(cfg.AgyConfigDir()),
+		modelCatalog: agy.NewModelCatalog(cfg.AgyBinary),
 		promptWriter: agy.NewPromptFileWriter(cfg.PromptThreshold),
 		workdirs:     make(map[string]int),
 		cancels:      make(map[string]activePrompt),
@@ -53,6 +55,9 @@ func (a *AgyAgent) SetAgentConnection(conn *acp.AgentSideConnection) {
 
 func (a *AgyAgent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
 	slog.Info("initialize received", "protocolVersion", params.ProtocolVersion)
+	if err := a.modelCatalog.EnsureLoaded(ctx); err != nil {
+		return acp.InitializeResponse{}, fmt.Errorf("load models: %w", err)
+	}
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
@@ -69,6 +74,10 @@ func (a *AgyAgent) Authenticate(ctx context.Context, params acp.AuthenticateRequ
 }
 
 func (a *AgyAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	if err := a.modelCatalog.EnsureLoaded(ctx); err != nil {
+		return acp.NewSessionResponse{}, fmt.Errorf("load models: %w", err)
+	}
+
 	a.registerWorkdir(params.Cwd)
 
 	sess, err := a.store.Create(params.Cwd)
@@ -77,7 +86,12 @@ func (a *AgyAgent) NewSession(ctx context.Context, params acp.NewSessionRequest)
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
 
-	sess.SetModel(normalizeModel(a.cfg.DefaultModel))
+	modelID, err := a.modelCatalog.ResolveCanonical(a.cfg.DefaultModel)
+	if err != nil {
+		slog.Warn("invalid default model configured, using catalog default", "model", a.cfg.DefaultModel, "error", err)
+		modelID = a.modelCatalog.DefaultModelID()
+	}
+	sess.SetModel(modelID)
 
 	slog.Info("new session created", "sessionId", sess.ID, "cwd", params.Cwd, "model", sess.GetModel())
 
@@ -149,9 +163,14 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 	convID := sess.GetConversationID()
 	turnCount := sess.GetTurnCount()
 
+	nativeModel, err := a.modelCatalog.ResolveNative(sess.GetModel(), sess.GetReasoningEffort())
+	if err != nil {
+		return "", err
+	}
+
 	opts := agy.ExecuteOpts{
 		Cwd:       sess.Cwd,
-		Model:     agyModelLabel(sess.GetModel()),
+		Model:     nativeModel,
 		Timeout:   time.Duration(a.cfg.TimeoutSeconds) * time.Second,
 		SkipPerms: a.cfg.SkipPerms,
 	}
@@ -281,49 +300,18 @@ func (a *AgyAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRe
 	return acp.ResumeSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionResume)
 }
 
-const modelConfigID = "model"
-const defaultModel = "google/gemini-3.5-flash-high"
-
-type modelOption struct {
-	Slug     string
-	Name     string
-	AgyLabel string
-}
-
-var knownModels = []modelOption{
-	{Slug: defaultModel, Name: "Gemini 3.5 Flash (High)", AgyLabel: "Gemini 3.5 Flash (High)"},
-	{Slug: "google/gemini-3.5-flash-medium", Name: "Gemini 3.5 Flash (Medium)", AgyLabel: "Gemini 3.5 Flash (Medium)"},
-	{Slug: "google/gemini-3.5-flash-low", Name: "Gemini 3.5 Flash (Low)", AgyLabel: "Gemini 3.5 Flash (Low)"},
-	{Slug: "google/gemini-3.1-pro", Name: "Gemini 3.1 Pro (High)", AgyLabel: "Gemini 3.1 Pro (High)"},
-	{Slug: "anthropic/claude-sonnet-4.6-thinking", Name: "Claude Sonnet 4.6 (Thinking)", AgyLabel: "Claude Sonnet 4.6 (Thinking)"},
-	{Slug: "anthropic/claude-opus-4.6-thinking", Name: "Claude Opus 4.6 (Thinking)", AgyLabel: "Claude Opus 4.6 (Thinking)"},
-}
-
-var modelAliases = map[string]string{
-	"gemini-3.5-flash-high":             "google/gemini-3.5-flash-high",
-	"gemini-3.5-flash-medium":           "google/gemini-3.5-flash-medium",
-	"gemini-3.5-flash-low":              "google/gemini-3.5-flash-low",
-	"gemini-3.1-pro":                    "google/gemini-3.1-pro",
-	"gemini-3.1-pro-high":               "google/gemini-3.1-pro",
-	"google/gemini-3.1-pro-high":        "google/gemini-3.1-pro",
-	"claude-sonnet-4.6-thinking":        "anthropic/claude-sonnet-4.6-thinking",
-	"claude-sonnet-4.6":                 "anthropic/claude-sonnet-4.6-thinking",
-	"claude-opus-4.6-thinking":          "anthropic/claude-opus-4.6-thinking",
-	"claude-opus-4.6":                   "anthropic/claude-opus-4.6-thinking",
-	"google/claude-sonnet-4.6-thinking": "anthropic/claude-sonnet-4.6-thinking",
-	"google/claude-sonnet-4.6":          "anthropic/claude-sonnet-4.6-thinking",
-	"google/claude-opus-4.6-thinking":   "anthropic/claude-opus-4.6-thinking",
-	"google/claude-opus-4.6":            "anthropic/claude-opus-4.6-thinking",
-	"anthropic/claude-sonnet-4.6":       "anthropic/claude-sonnet-4.6-thinking",
-	"anthropic/claude-opus-4.6":         "anthropic/claude-opus-4.6-thinking",
-}
+const (
+	modelConfigID           = "model"
+	reasoningEffortConfigID = "reasoning_effort"
+)
 
 func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
 	if params.ValueId == nil {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("unsupported config option type")
 	}
 
-	if string(params.ValueId.ConfigId) != modelConfigID {
+	configID := string(params.ValueId.ConfigId)
+	if configID != modelConfigID && configID != reasoningEffortConfigID {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("unknown config option: %s", params.ValueId.ConfigId)
 	}
 
@@ -333,9 +321,25 @@ func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSes
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("session %s not found", sid)
 	}
 
-	newModel := normalizeModel(string(params.ValueId.Value))
-	sess.SetModel(newModel)
-	slog.Info("model changed", "sessionId", sid, "model", newModel)
+	value := string(params.ValueId.Value)
+	switch configID {
+	case modelConfigID:
+		newModel, err := a.modelCatalog.ResolveCanonical(value)
+		if err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
+		}
+		if _, err := a.modelCatalog.ResolveNative(newModel, sess.GetReasoningEffort()); err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
+		}
+		sess.SetModel(newModel)
+		slog.Info("model changed", "sessionId", sid, "model", newModel)
+	case reasoningEffortConfigID:
+		if _, err := a.modelCatalog.ResolveNative(sess.GetModel(), value); err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
+		}
+		sess.SetReasoningEffort(value)
+		slog.Info("reasoning effort changed", "sessionId", sid, "reasoningEffort", value)
+	}
 
 	return acp.SetSessionConfigOptionResponse{
 		ConfigOptions: a.buildConfigOptions(sess),
@@ -343,53 +347,60 @@ func (a *AgyAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSes
 }
 
 func (a *AgyAgent) buildConfigOptions(sess *session.Context) []acp.SessionConfigOption {
-	currentModel := normalizeModel(sess.GetModel())
+	currentModel := sess.GetModel()
+	if !a.modelCatalog.Contains(currentModel) {
+		currentModel = a.modelCatalog.DefaultModelID()
+	}
 
-	options := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(knownModels))
-	for _, model := range knownModels {
-		options = append(options, acp.SessionConfigSelectOption{
-			Value: acp.SessionConfigValueId(model.Slug),
-			Name:  model.Name,
+	profiles := a.modelCatalog.Profiles()
+	modelOptions := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(profiles))
+	for _, profile := range profiles {
+		modelOptions = append(modelOptions, acp.SessionConfigSelectOption{
+			Value: acp.SessionConfigValueId(profile.CanonicalID),
+			Name:  profile.DisplayName,
 		})
 	}
 
-	category := acp.SessionConfigOptionCategoryModel
-	return []acp.SessionConfigOption{
-		{
-			Select: &acp.SessionConfigOptionSelect{
-				Id:           acp.SessionConfigId(modelConfigID),
-				Name:         "Model",
-				Type:         "select",
-				Category:     &category,
-				CurrentValue: acp.SessionConfigValueId(currentModel),
-				Options: acp.SessionConfigSelectOptions{
-					Ungrouped: &options,
-				},
-			},
+	modelCategory := acp.SessionConfigOptionCategoryModel
+	result := []acp.SessionConfigOption{{
+		Select: &acp.SessionConfigOptionSelect{
+			Id:           acp.SessionConfigId(modelConfigID),
+			Name:         "Model",
+			Type:         "select",
+			Category:     &modelCategory,
+			CurrentValue: acp.SessionConfigValueId(currentModel),
+			Options:      acp.SessionConfigSelectOptions{Ungrouped: &modelOptions},
 		},
-	}
-}
+	}}
 
-func normalizeModel(model string) string {
-	if alias, ok := modelAliases[model]; ok {
-		return alias
+	efforts := a.modelCatalog.SupportedEfforts(currentModel)
+	if len(efforts) == 0 {
+		return result
 	}
-	for _, known := range knownModels {
-		if model == known.Slug || model == known.AgyLabel || model == known.Name {
-			return known.Slug
+	currentEffort := sess.GetReasoningEffort()
+	if currentEffort == "" {
+		for _, profile := range profiles {
+			if profile.CanonicalID == currentModel {
+				currentEffort = profile.DefaultEffort
+				break
+			}
 		}
 	}
-	return defaultModel
-}
-
-func agyModelLabel(model string) string {
-	model = normalizeModel(model)
-	for _, known := range knownModels {
-		if model == known.Slug {
-			return known.AgyLabel
-		}
+	effortOptions := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(efforts))
+	for _, effort := range efforts {
+		effortOptions = append(effortOptions, acp.SessionConfigSelectOption{
+			Value: acp.SessionConfigValueId(effort),
+			Name:  strings.ToUpper(effort[:1]) + effort[1:],
+		})
 	}
-	return agyModelLabel(defaultModel)
+	result = append(result, acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
+		Id:           acp.SessionConfigId(reasoningEffortConfigID),
+		Name:         "Reasoning effort",
+		Type:         "select",
+		CurrentValue: acp.SessionConfigValueId(currentEffort),
+		Options:      acp.SessionConfigSelectOptions{Ungrouped: &effortOptions},
+	}})
+	return result
 }
 
 func (a *AgyAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
