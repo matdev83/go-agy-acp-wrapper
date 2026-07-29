@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
-	"time"
 )
 
 type Store struct {
@@ -20,7 +19,10 @@ func NewStore() *Store {
 }
 
 func (s *Store) Create(cwd string) (*Context, error) {
-	id := generateSessionID()
+	id, err := generateSessionID()
+	if err != nil {
+		return nil, err
+	}
 	ctx := NewContext(id, cwd)
 	s.mu.Lock()
 	s.sessions[id] = ctx
@@ -44,19 +46,22 @@ func (s *Store) Delete(id string) {
 	s.mu.Unlock()
 }
 
-func (s *Store) CloseAll() {
+func (s *Store) CloseAll() []*Context {
 	s.mu.Lock()
+	closed := make([]*Context, 0, len(s.sessions))
 	for id, ctx := range s.sessions {
 		ctx.Close()
+		closed = append(closed, ctx)
 		delete(s.sessions, id)
 	}
 	s.mu.Unlock()
+	return closed
 }
 
-func generateSessionID() string {
-	var b [4]byte
+func generateSessionID() (string, error) {
+	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+		return "", fmt.Errorf("generate session ID: %w", err)
 	}
-	return "sess_" + hex.EncodeToString(b[:])
+	return "sess_" + hex.EncodeToString(b[:]), nil
 }

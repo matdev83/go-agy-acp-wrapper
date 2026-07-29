@@ -1,6 +1,9 @@
 package agy
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,19 +13,33 @@ import (
 )
 
 type PromptFileWriter struct {
-	threshold int
+	threshold  int
+	instanceID string
 }
 
 const PromptFileDirName = ".go-agy-acp-wrapper"
 
 func NewPromptFileWriter(threshold int) *PromptFileWriter {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(fmt.Sprintf("generate prompt writer instance ID: %v", err))
+	}
 	return &PromptFileWriter{
-		threshold: threshold,
+		threshold:  threshold,
+		instanceID: "instance_" + hex.EncodeToString(id[:]),
 	}
 }
 
 func (w *PromptFileWriter) NeedsFile(prompt string) bool {
 	return len(prompt) > w.threshold
+}
+
+func (w *PromptFileWriter) InstanceDir(cwd string) (string, error) {
+	root, err := w.workdirDir(cwd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, w.instanceID), nil
 }
 
 func (w *PromptFileWriter) WritePromptFile(cwd, sessionID string, turnCount int, prompt string) (string, error) {
@@ -87,11 +104,27 @@ func (w *PromptFileWriter) CleanupSession(cwd, sessionID string) error {
 }
 
 func (w *PromptFileWriter) CleanupWorkdir(cwd string) error {
-	dir, err := w.workdirDir(cwd)
+	root, err := w.workdirDir(cwd)
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(dir)
+	if err := os.RemoveAll(filepath.Join(root, w.instanceID)); err != nil {
+		return err
+	}
+
+	// Remove the shared root only when no other wrapper instance owns entries.
+	err = os.Remove(root)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr == nil && len(entries) > 0 {
+		return nil
+	}
+	if errors.Is(readErr, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (w *PromptFileWriter) sessionDir(cwd, sessionID string) (string, error) {
@@ -99,7 +132,7 @@ func (w *PromptFileWriter) sessionDir(cwd, sessionID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, sessionID), nil
+	return filepath.Join(dir, w.instanceID, sessionID), nil
 }
 
 func (w *PromptFileWriter) workdirDir(cwd string) (string, error) {

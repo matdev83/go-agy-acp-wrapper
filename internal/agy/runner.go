@@ -83,6 +83,11 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	cmd := exec.CommandContext(execCtx, r.binary, args...)
 	cmd.Dir = opts.Cwd
 	cmd.Env = r.commandEnv()
+	processTree, err := configureProcessTree(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("configure agy process tree: %w", err)
+	}
+	defer processTree.Close()
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -95,6 +100,11 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to execute agy: %w", err)
+	}
+	if err := processTree.AfterStart(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("contain agy process tree: %w", err)
 	}
 	if tailer != nil {
 		tailer.startedAt = time.Now()
@@ -162,14 +172,6 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 		if extracted := r.extractFromTranscript(opts.ConversationID); extracted != "" {
 			slog.Debug("stdout empty, extracted response from transcript", "conversationId", opts.ConversationID)
 			response.Output = extracted
-		}
-	} else if strings.TrimSpace(response.Output) == "" && r.configDir != "" {
-		disc := NewConversationDiscoverer(r.configDir)
-		if convID, err := disc.DiscoverConversationID(opts.Cwd); err == nil {
-			if extracted := r.extractFromTranscript(convID); extracted != "" {
-				slog.Debug("stdout empty, extracted response from transcript (discovered)", "conversationId", convID)
-				response.Output = extracted
-			}
 		}
 	}
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,14 +28,23 @@ type AgyAgent struct {
 	discoverer   *agy.ConversationDiscoverer
 	modelCatalog *agy.ModelCatalog
 	promptWriter *agy.PromptFileWriter
+	coordinator  *agy.RepoCoordinator
 	mu           sync.Mutex
 	workdirs     map[string]int
 	cancels      map[string]activePrompt
+	finalizers   map[string]*sessionFinalizer
+	closed       bool
 }
 
 type activePrompt struct {
 	token  *struct{}
 	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+type sessionFinalizer struct {
+	done chan struct{}
+	err  error
 }
 
 func NewAgyAgent(cfg *config.Config) *AgyAgent {
@@ -44,8 +55,10 @@ func NewAgyAgent(cfg *config.Config) *AgyAgent {
 		discoverer:   agy.NewConversationDiscoverer(cfg.AgyConfigDir()),
 		modelCatalog: agy.NewModelCatalog(cfg.AgyBinary),
 		promptWriter: agy.NewPromptFileWriter(cfg.PromptThreshold),
+		coordinator:  agy.NewRepoCoordinator(cfg.AgyConfigDir()),
 		workdirs:     make(map[string]int),
 		cancels:      make(map[string]activePrompt),
+		finalizers:   make(map[string]*sessionFinalizer),
 	}
 }
 
@@ -78,11 +91,21 @@ func (a *AgyAgent) NewSession(ctx context.Context, params acp.NewSessionRequest)
 		return acp.NewSessionResponse{}, fmt.Errorf("load models: %w", err)
 	}
 
-	a.registerWorkdir(params.Cwd)
-
-	sess, err := a.store.Create(params.Cwd)
+	canonicalCwd, err := canonicalSessionCwd(params.Cwd)
 	if err != nil {
-		a.unregisterWorkdir(params.Cwd)
+		return acp.NewSessionResponse{}, err
+	}
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return acp.NewSessionResponse{}, fmt.Errorf("agent is closed")
+	}
+	sess, err := a.store.Create(canonicalCwd)
+	if err == nil {
+		a.workdirs[workdirKey(canonicalCwd)]++
+	}
+	a.mu.Unlock()
+	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
 
@@ -115,13 +138,29 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	}
 
 	promptCtx, cancel := context.WithCancel(ctx)
-	token, ok := a.startPrompt(sid, cancel)
+	token, _, ok := a.startPrompt(sid, cancel)
 	if !ok {
 		cancel()
 		return acp.PromptResponse{}, fmt.Errorf("session %s already has an active prompt", sid)
 	}
 	defer a.finishPrompt(sid, token)
 
+	unlock, err := a.coordinator.Lock(promptCtx, sess.Cwd)
+	if err != nil {
+		if promptCtx.Err() == context.Canceled {
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+		}
+		return acp.PromptResponse{}, fmt.Errorf("coordinate repository prompt: %w", err)
+	}
+	defer func() {
+		if err := unlock(); err != nil {
+			slog.Warn("unlock repository prompt failed", "sessionId", sid, "error", err)
+		}
+	}()
+
+	if sess.IsClosed() {
+		return acp.PromptResponse{}, fmt.Errorf("session %s is closed", sid)
+	}
 	sess.AddUserMessage(promptText)
 
 	var streamed atomic.Bool
@@ -200,6 +239,13 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		return resp.Output, nil
 
 	default:
+		previousID, err := a.discoverer.SnapshotConversationID(ctx, sess.Cwd)
+		if err != nil {
+			slog.Warn("conversation cache snapshot failed, using fallback context", "error", err, "sessionId", sess.ID)
+			sess.SwitchToFallback()
+			return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
+		}
+		startedAt := time.Now()
 		opts.Prompt = promptText
 		if a.promptWriter.NeedsFile(promptText) {
 			path, err := a.promptWriter.WritePromptFile(sess.Cwd, sess.ID, turnCount, promptText)
@@ -215,8 +261,8 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			return "", err
 		}
 
-		if convID == "" {
-			a.discoverAndSetConversationID(sess)
+		if convID == "" && !a.discoverAndSetConversationID(ctx, sess, previousID, startedAt) {
+			sess.SwitchToFallback()
 		}
 
 		return resp.Output, nil
@@ -246,23 +292,20 @@ func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Contex
 	return resp.Output, nil
 }
 
-func (a *AgyAgent) discoverAndSetConversationID(sess *session.Context) {
-	id, err := a.discoverer.DiscoverConversationID(sess.Cwd)
+func (a *AgyAgent) discoverAndSetConversationID(ctx context.Context, sess *session.Context, previousID string, startedAt time.Time) bool {
+	id, err := a.discoverer.DiscoverNewConversationID(ctx, sess.Cwd, previousID, startedAt)
 	if err != nil {
-		slog.Debug("could not discover conversation ID", "error", err, "sessionId", sess.ID)
-		return
-	}
-	if !a.discoverer.ValidateConversationID(id) {
-		slog.Debug("discovered conversation ID invalid", "id", id, "sessionId", sess.ID)
-		return
+		slog.Warn("conversation attribution failed, switching to fallback", "error", err, "sessionId", sess.ID)
+		return false
 	}
 	sess.SetConversationID(id)
 	slog.Info("conversation ID discovered", "conversationId", id, "sessionId", sess.ID)
+	return true
 }
 
 func (a *AgyAgent) Cancel(ctx context.Context, params acp.CancelNotification) error {
 	sid := string(params.SessionId)
-	if cancel := a.cancelPrompt(sid); cancel != nil {
+	if cancel, _ := a.cancelPrompt(sid); cancel != nil {
 		cancel()
 		slog.Info("cancelled active prompt", "sessionId", sid)
 		return nil
@@ -273,19 +316,24 @@ func (a *AgyAgent) Cancel(ctx context.Context, params acp.CancelNotification) er
 
 func (a *AgyAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	sid := string(params.SessionId)
-	if cancel := a.cancelPrompt(sid); cancel != nil {
-		cancel()
+	finalizer := a.beginSessionFinalizer(sid)
+	if finalizer == nil {
+		return acp.CloseSessionResponse{}, nil
 	}
-	sess, ok := a.store.Get(sid)
-	a.store.Delete(sid)
-	if ok {
-		_ = a.promptWriter.CleanupSession(sess.Cwd, sid)
-		if a.unregisterWorkdir(sess.Cwd) {
-			_ = a.promptWriter.CleanupWorkdir(sess.Cwd)
+	select {
+	case <-finalizer.done:
+		a.mu.Lock()
+		err := finalizer.err
+		a.mu.Unlock()
+		if err != nil {
+			return acp.CloseSessionResponse{}, fmt.Errorf("finalize session %s: %w", sid, err)
 		}
+		slog.Info("session closed", "sessionId", sid)
+		return acp.CloseSessionResponse{}, nil
+	case <-ctx.Done():
+		// Finalization intentionally continues after the request deadline.
+		return acp.CloseSessionResponse{}, ctx.Err()
 	}
-	slog.Info("session closed", "sessionId", sid)
-	return acp.CloseSessionResponse{}, nil
 }
 
 func (a *AgyAgent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
@@ -408,27 +456,139 @@ func (a *AgyAgent) SetSessionMode(ctx context.Context, params acp.SetSessionMode
 }
 
 func (a *AgyAgent) Close() {
-	cancels := a.closePrompts()
-	for _, cancel := range cancels {
-		cancel()
+	a.mu.Lock()
+	if a.closed {
+		finalizers := a.finalizerSnapshotLocked()
+		a.mu.Unlock()
+		waitFinalizers(finalizers)
+		return
 	}
+	a.closed = true
+	sessions := a.store.CloseAll()
+	type pendingFinalizer struct {
+		sess      *session.Context
+		prompt    activePrompt
+		finalizer *sessionFinalizer
+	}
+	pending := make([]pendingFinalizer, 0, len(sessions))
+	for _, sess := range sessions {
+		if _, exists := a.finalizers[sess.ID]; exists {
+			continue
+		}
+		finalizer := &sessionFinalizer{done: make(chan struct{})}
+		a.finalizers[sess.ID] = finalizer
+		pending = append(pending, pendingFinalizer{sess: sess, prompt: a.cancels[sess.ID], finalizer: finalizer})
+	}
+	finalizers := a.finalizerSnapshotLocked()
+	a.mu.Unlock()
+
+	for _, item := range pending {
+		a.runSessionFinalizer(item.sess, item.prompt, item.finalizer)
+	}
+	waitFinalizers(finalizers)
 	workdirs := a.closeWorkdirs()
 	for _, cwd := range workdirs {
-		_ = a.promptWriter.CleanupWorkdir(cwd)
+		if err := retryCleanup(func() error { return a.promptWriter.CleanupWorkdir(cwd) }); err != nil {
+			slog.Error("workdir cleanup failed", "cwd", cwd, "error", err)
+		}
 	}
-	a.store.CloseAll()
 }
 
-func (a *AgyAgent) startPrompt(sessionID string, cancel context.CancelFunc) (*struct{}, bool) {
+func waitFinalizers(finalizers []*sessionFinalizer) {
+	for _, finalizer := range finalizers {
+		<-finalizer.done
+		if finalizer.err != nil {
+			slog.Error("session finalization failed", "error", finalizer.err)
+		}
+	}
+}
+
+func (a *AgyAgent) beginSessionFinalizer(sessionID string) *sessionFinalizer {
+	a.mu.Lock()
+	if finalizer, ok := a.finalizers[sessionID]; ok {
+		a.mu.Unlock()
+		return finalizer
+	}
+	sess, ok := a.store.Get(sessionID)
+	if !ok {
+		a.mu.Unlock()
+		return nil
+	}
+	sess.Close()
+	a.store.Delete(sessionID)
+	finalizer := &sessionFinalizer{done: make(chan struct{})}
+	a.finalizers[sessionID] = finalizer
+	prompt := a.cancels[sessionID]
+	a.mu.Unlock()
+	a.runSessionFinalizer(sess, prompt, finalizer)
+	return finalizer
+}
+
+func (a *AgyAgent) beginSessionFinalizerFor(sess *session.Context) *sessionFinalizer {
+	a.mu.Lock()
+	if finalizer, ok := a.finalizers[sess.ID]; ok {
+		a.mu.Unlock()
+		return finalizer
+	}
+	finalizer := &sessionFinalizer{done: make(chan struct{})}
+	a.finalizers[sess.ID] = finalizer
+	prompt := a.cancels[sess.ID]
+	a.mu.Unlock()
+	a.runSessionFinalizer(sess, prompt, finalizer)
+	return finalizer
+}
+
+func (a *AgyAgent) runSessionFinalizer(sess *session.Context, prompt activePrompt, finalizer *sessionFinalizer) {
+	if prompt.cancel != nil {
+		prompt.cancel()
+	}
+	go func() {
+		if prompt.done != nil {
+			<-prompt.done
+		}
+		err := retryCleanup(func() error {
+			return a.promptWriter.CleanupSession(sess.Cwd, sess.ID)
+		})
+		if err == nil {
+			a.unregisterWorkdir(sess.Cwd)
+		}
+		a.mu.Lock()
+		finalizer.err = err
+		close(finalizer.done)
+		a.mu.Unlock()
+	}()
+}
+
+func retryCleanup(cleanup func() error) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = cleanup(); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	return err
+}
+
+func (a *AgyAgent) finalizerSnapshotLocked() []*sessionFinalizer {
+	result := make([]*sessionFinalizer, 0, len(a.finalizers))
+	for _, finalizer := range a.finalizers {
+		result = append(result, finalizer)
+	}
+	return result
+}
+
+func (a *AgyAgent) startPrompt(sessionID string, cancel context.CancelFunc) (*struct{}, <-chan struct{}, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if _, ok := a.cancels[sessionID]; ok {
-		return nil, false
+	if current, ok := a.cancels[sessionID]; ok {
+		return nil, current.done, false
 	}
 	token := &struct{}{}
-	a.cancels[sessionID] = activePrompt{token: token, cancel: cancel}
-	return token, true
+	done := make(chan struct{})
+	a.cancels[sessionID] = activePrompt{token: token, cancel: cancel, done: done}
+	return token, done, true
 }
 
 func (a *AgyAgent) finishPrompt(sessionID string, token *struct{}) {
@@ -437,48 +597,68 @@ func (a *AgyAgent) finishPrompt(sessionID string, token *struct{}) {
 
 	if current, ok := a.cancels[sessionID]; ok && current.token == token {
 		delete(a.cancels, sessionID)
+		close(current.done)
 	}
 }
 
-func (a *AgyAgent) cancelPrompt(sessionID string) context.CancelFunc {
+func (a *AgyAgent) cancelPrompt(sessionID string) (context.CancelFunc, <-chan struct{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	prompt, ok := a.cancels[sessionID]
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	return prompt.cancel
+	return prompt.cancel, prompt.done
 }
 
-func (a *AgyAgent) closePrompts() []context.CancelFunc {
+func (a *AgyAgent) closePrompts() []activePrompt {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	cancels := make([]context.CancelFunc, 0, len(a.cancels))
+	prompts := make([]activePrompt, 0, len(a.cancels))
 	for _, prompt := range a.cancels {
-		cancels = append(cancels, prompt.cancel)
+		prompts = append(prompts, prompt)
 	}
-	a.cancels = make(map[string]activePrompt)
-	return cancels
+	return prompts
+}
+
+func canonicalSessionCwd(cwd string) (string, error) {
+	absolute, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve cwd: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		absolute = resolved
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func workdirKey(cwd string) string {
+	key := filepath.Clean(cwd)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
 }
 
 func (a *AgyAgent) registerWorkdir(cwd string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.workdirs[cwd]++
+	a.workdirs[workdirKey(cwd)]++
 }
 
 func (a *AgyAgent) unregisterWorkdir(cwd string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.workdirs[cwd] <= 1 {
-		delete(a.workdirs, cwd)
+	key := workdirKey(cwd)
+	if a.workdirs[key] <= 1 {
+		delete(a.workdirs, key)
 		return true
 	}
-	a.workdirs[cwd]--
+	a.workdirs[key]--
 	return false
 }
 
