@@ -19,10 +19,14 @@ internal/acp/agent.go
 internal/acp/agent_test.go
 internal/agy/conversation.go
 internal/agy/conversation_test.go
+internal/agy/coordinator.go
+internal/agy/coordinator_test.go
 internal/agy/models.go
 internal/agy/models_test.go
 internal/agy/promptfile.go
 internal/agy/promptfile_test.go
+internal/agy/process_unix.go
+internal/agy/process_windows.go
 internal/agy/runner.go
 internal/agy/runner_test.go
 internal/agy/signal_unix.go

@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/matdev83/go-agy-acp-wrapper/internal/agy"
 	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/session"
 )
 
 func newTestConfig(t *testing.T) *config.Config {
@@ -203,9 +205,6 @@ func TestAgyAgent_CloseSession(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("expected session prompt file to be removed")
-	}
-	if _, err := os.Stat(filepath.Join(cwd, agy.PromptFileDirName)); !os.IsNotExist(err) {
-		t.Fatal("expected workdir prompt dir to be removed after last session closes")
 	}
 }
 
@@ -537,6 +536,179 @@ func TestAgyAgent_Cancel_BlocksNewPromptUntilOldPromptFinishes(t *testing.T) {
 	}
 }
 
+func TestAgyAgent_CloseSessionWaitsForPromptBeforeCleanup(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	runner := newSlowCancelRunner()
+	agent.runner = runner
+	cwd := t.TempDir()
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	path, err := agent.promptWriter.WritePromptFile(cwd, string(sessResp.SessionId), 1, "owned by active prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	promptDone := make(chan struct{})
+	go func() {
+		defer close(promptDone)
+		_, _ = agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: sessResp.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("first")},
+		})
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("prompt did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: sessResp.SessionId})
+		closeDone <- err
+	}()
+	select {
+	case <-runner.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("close did not cancel runner")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("prompt file removed while runner was still active: %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close returned before runner stopped: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(runner.release)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("CloseSession failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish after runner stopped")
+	}
+	<-promptDone
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("prompt file remained after close completed")
+	}
+}
+
+func TestAgyAgent_CloseSessionTimeoutStillFinalizes(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	runner := newSlowCancelRunner()
+	agent.runner = runner
+	cwd := t.TempDir()
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := agent.promptWriter.WritePromptFile(cwd, string(sessResp.SessionId), 1, "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	promptDone := make(chan struct{})
+	go func() {
+		defer close(promptDone)
+		_, _ = agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: sessResp.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("first")},
+		})
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("prompt did not start")
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := agent.CloseSession(closeCtx, acp.CloseSessionRequest{SessionId: sessResp.SessionId}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected close deadline, got %v", err)
+	}
+	if _, ok := agent.store.Get(string(sessResp.SessionId)); ok {
+		t.Fatal("closing session remained publicly accessible")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("prompt file removed before runner stopped: %v", err)
+	}
+
+	close(runner.release)
+	select {
+	case <-promptDone:
+	case <-time.After(time.Second):
+		t.Fatal("prompt did not unwind")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background finalizer did not remove prompt file")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAgyAgent_AttributionFailureSwitchesToFallback(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	agent.runner = stubRunner{}
+	resp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+
+	if _, err := agent.executeTurn(context.Background(), sess, "test prompt", nil); err != nil {
+		t.Fatalf("executeTurn failed: %v", err)
+	}
+	if sess.GetMode() != session.ModeFallbackContext {
+		t.Fatal("expected attribution failure to select fallback mode")
+	}
+}
+
+func TestAgyAgent_NewSessionCanonicalizesCwdAliases(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	cwd := t.TempDir()
+	child := filepath.Join(cwd, "child")
+	if err := os.Mkdir(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(child, "..")
+
+	first, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: alias})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSession, _ := agent.store.Get(string(first.SessionId))
+	secondSession, _ := agent.store.Get(string(second.SessionId))
+	if firstSession.Cwd != secondSession.Cwd {
+		t.Fatalf("cwd aliases were not canonicalized: %q != %q", firstSession.Cwd, secondSession.Cwd)
+	}
+}
+
 func TestAgyAgent_ExecuteFallbackTurn_DoesNotDuplicateCurrentPrompt(t *testing.T) {
 	cfg := newTestConfig(t)
 	agent := NewAgyAgent(cfg)
@@ -567,5 +739,9 @@ func TestAgyAgent_ExecuteFallbackTurn_DoesNotDuplicateCurrentPrompt(t *testing.T
 }
 
 func (a *AgyAgent) promptWriterTestContextPath(cwd, sessionID string, turnCount int) string {
-	return filepath.Join(cwd, agy.PromptFileDirName, sessionID, fmt.Sprintf("context_%d.md", turnCount))
+	instanceDir, err := a.promptWriter.InstanceDir(cwd)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(instanceDir, sessionID, fmt.Sprintf("context_%d.md", turnCount))
 }

@@ -1,9 +1,11 @@
 package agy
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/matdev83/go-agy-acp-wrapper/internal/session"
@@ -32,7 +34,7 @@ func TestPromptFileWriter_WritePromptFile(t *testing.T) {
 		t.Fatalf("WritePromptFile failed: %v", err)
 	}
 
-	expectedDir := filepath.Join(cwd, PromptFileDirName, "sess_abc")
+	expectedDir := filepath.Join(cwd, PromptFileDirName, w.instanceID, "sess_abc")
 	if !strings.HasPrefix(path, expectedDir) {
 		t.Fatalf("expected path under %s, got %s", expectedDir, path)
 	}
@@ -89,7 +91,7 @@ func TestPromptFileWriter_CleanupSession(t *testing.T) {
 		t.Fatalf("WritePromptFile failed: %v", err)
 	}
 
-	dir := filepath.Join(cwd, PromptFileDirName, "sess_cleanup")
+	dir := filepath.Join(cwd, PromptFileDirName, w.instanceID, "sess_cleanup")
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("session dir should exist: %v", err)
 	}
@@ -111,6 +113,9 @@ func TestPromptFileWriter_CleanupWorkdir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WritePromptFile failed: %v", err)
 	}
+	if err := w.CleanupSession(cwd, "sess_cleanup"); err != nil {
+		t.Fatalf("CleanupSession failed: %v", err)
+	}
 
 	dir := filepath.Join(cwd, PromptFileDirName)
 	if _, err := os.Stat(dir); err != nil {
@@ -122,6 +127,71 @@ func TestPromptFileWriter_CleanupWorkdir(t *testing.T) {
 	}
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatal("expected workdir temp dir to be removed")
+		t.Fatal("expected empty workdir temp dir to be removed")
+	}
+}
+
+func TestPromptFileWriter_CleanupWorkdirPreservesOtherInstance(t *testing.T) {
+	cwd := t.TempDir()
+	first := NewPromptFileWriter(100)
+	second := NewPromptFileWriter(100)
+
+	if _, err := first.WritePromptFile(cwd, "first", 1, "first prompt"); err != nil {
+		t.Fatalf("first instance write failed: %v", err)
+	}
+	secondPath, err := second.WritePromptFile(cwd, "second", 1, "second prompt")
+	if err != nil {
+		t.Fatalf("second instance write failed: %v", err)
+	}
+
+	if err := first.CleanupSession(cwd, "first"); err != nil {
+		t.Fatalf("first instance session cleanup failed: %v", err)
+	}
+	if err := first.CleanupWorkdir(cwd); err != nil {
+		t.Fatalf("first instance workdir cleanup failed: %v", err)
+	}
+
+	data, err := os.ReadFile(secondPath)
+	if err != nil {
+		t.Fatalf("first instance removed second instance's prompt: %v", err)
+	}
+	if string(data) != "second prompt" {
+		t.Fatalf("unexpected second prompt content: %q", data)
+	}
+}
+
+func TestPromptFileWriter_ConcurrentInstancesInDifferentRepos(t *testing.T) {
+	writers := []*PromptFileWriter{NewPromptFileWriter(100), NewPromptFileWriter(100)}
+	cwds := []string{t.TempDir(), t.TempDir()}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, len(writers))
+	for instance := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for turn := 1; turn <= 50; turn++ {
+				content := fmt.Sprintf("instance %d turn %d", instance, turn)
+				path, err := writers[instance].WritePromptFile(cwds[instance], "session", turn, content)
+				if err != nil {
+					errs <- err
+					return
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					errs <- fmt.Errorf("instance %d turn %d: read prompt: %w", instance, turn, err)
+					return
+				}
+				if string(data) != content {
+					errs <- fmt.Errorf("instance %d turn %d: content=%q, want %q", instance, turn, data, content)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
