@@ -1,0 +1,6 @@
+# Repository ownership and security-sensitive automation.
+* @matdev83
+/.github/ @matdev83
+/.goreleaser.yaml @matdev83
+/.release-files @matdev83
+/scripts/ @matdev83
