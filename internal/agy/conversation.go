@@ -55,6 +55,16 @@ func (d *ConversationDiscoverer) SnapshotConversationID(ctx context.Context, cwd
 	return id, err
 }
 
+func isSafeConversationID(id string) bool {
+	if id == "" || id == "." || id == ".." || filepath.IsAbs(id) {
+		return false
+	}
+	if filepath.Clean(id) != id || filepath.Base(id) != id {
+		return false
+	}
+	return !strings.ContainsAny(id, `/\\`)
+}
+
 // DiscoverNewConversationID accepts only a changed mapping whose brain directory
 // was created or updated during this invocation.
 func (d *ConversationDiscoverer) DiscoverNewConversationID(ctx context.Context, cwd, previousID string, startedAt time.Time) (string, error) {
@@ -69,7 +79,7 @@ func (d *ConversationDiscoverer) DiscoverNewConversationID(ctx context.Context, 
 	if id == previousID {
 		return "", fmt.Errorf("conversation for cwd %q unchanged (%q)", cwd, id)
 	}
-	if id == "" || id == "." || id == ".." || filepath.IsAbs(id) || filepath.Clean(id) != id || filepath.Base(id) != id || strings.ContainsAny(id, `/\\`) {
+	if !isSafeConversationID(id) {
 		return "", fmt.Errorf("discovered conversation ID %q is not a safe single path component", id)
 	}
 	brainRoot := filepath.Join(d.configDir, "brain")

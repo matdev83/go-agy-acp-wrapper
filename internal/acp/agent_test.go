@@ -539,6 +539,7 @@ func TestAgyAgent_Cancel_BlocksNewPromptUntilOldPromptFinishes(t *testing.T) {
 func TestAgyAgent_CloseSessionWaitsForPromptBeforeCleanup(t *testing.T) {
 	cfg := newTestConfig(t)
 	agent := NewAgyAgent(cfg)
+	defer agent.Close()
 	runner := newSlowCancelRunner()
 	agent.runner = runner
 	cwd := t.TempDir()
@@ -603,6 +604,7 @@ func TestAgyAgent_CloseSessionWaitsForPromptBeforeCleanup(t *testing.T) {
 func TestAgyAgent_CloseSessionTimeoutStillFinalizes(t *testing.T) {
 	cfg := newTestConfig(t)
 	agent := NewAgyAgent(cfg)
+	defer agent.Close()
 	runner := newSlowCancelRunner()
 	agent.runner = runner
 	cwd := t.TempDir()
@@ -662,15 +664,20 @@ func TestAgyAgent_CloseSessionTimeoutStillFinalizes(t *testing.T) {
 func TestAgyAgent_AttributionFailureSwitchesToFallback(t *testing.T) {
 	cfg := newTestConfig(t)
 	agent := NewAgyAgent(cfg)
-	sess, err := agent.store.Create(t.TempDir())
+	defer agent.Close()
+	agent.runner = stubRunner{}
+	resp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if agent.discoverAndSetConversationID(context.Background(), sess, "unchanged", time.Now()) {
-		t.Fatal("unexpected conversation attribution success")
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
 	}
-	sess.SwitchToFallback()
+
+	if _, err := agent.executeTurn(context.Background(), sess, "test prompt", nil); err != nil {
+		t.Fatalf("executeTurn failed: %v", err)
+	}
 	if sess.GetMode() != session.ModeFallbackContext {
 		t.Fatal("expected attribution failure to select fallback mode")
 	}
@@ -681,7 +688,11 @@ func TestAgyAgent_NewSessionCanonicalizesCwdAliases(t *testing.T) {
 	agent := NewAgyAgent(cfg)
 	defer agent.Close()
 	cwd := t.TempDir()
-	alias := filepath.Join(cwd, ".")
+	child := filepath.Join(cwd, "child")
+	if err := os.Mkdir(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(child, "..")
 
 	first, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: cwd})
 	if err != nil {

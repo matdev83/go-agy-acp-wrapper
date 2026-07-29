@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 type processTreeController struct{}
 
 func configureProcessTree(cmd *exec.Cmd) (*processTreeController, error) {
+	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {

@@ -524,20 +524,6 @@ func (a *AgyAgent) beginSessionFinalizer(sessionID string) *sessionFinalizer {
 	return finalizer
 }
 
-func (a *AgyAgent) beginSessionFinalizerFor(sess *session.Context) *sessionFinalizer {
-	a.mu.Lock()
-	if finalizer, ok := a.finalizers[sess.ID]; ok {
-		a.mu.Unlock()
-		return finalizer
-	}
-	finalizer := &sessionFinalizer{done: make(chan struct{})}
-	a.finalizers[sess.ID] = finalizer
-	prompt := a.cancels[sess.ID]
-	a.mu.Unlock()
-	a.runSessionFinalizer(sess, prompt, finalizer)
-	return finalizer
-}
-
 func (a *AgyAgent) runSessionFinalizer(sess *session.Context, prompt activePrompt, finalizer *sessionFinalizer) {
 	if prompt.cancel != nil {
 		prompt.cancel()
@@ -549,11 +535,10 @@ func (a *AgyAgent) runSessionFinalizer(sess *session.Context, prompt activePromp
 		err := retryCleanup(func() error {
 			return a.promptWriter.CleanupSession(sess.Cwd, sess.ID)
 		})
-		if err == nil {
-			a.unregisterWorkdir(sess.Cwd)
-		}
+		a.unregisterWorkdir(sess.Cwd)
 		a.mu.Lock()
 		finalizer.err = err
+		delete(a.finalizers, sess.ID)
 		close(finalizer.done)
 		a.mu.Unlock()
 	}()
@@ -612,17 +597,6 @@ func (a *AgyAgent) cancelPrompt(sessionID string) (context.CancelFunc, <-chan st
 	return prompt.cancel, prompt.done
 }
 
-func (a *AgyAgent) closePrompts() []activePrompt {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	prompts := make([]activePrompt, 0, len(a.cancels))
-	for _, prompt := range a.cancels {
-		prompts = append(prompts, prompt)
-	}
-	return prompts
-}
-
 func canonicalSessionCwd(cwd string) (string, error) {
 	absolute, err := filepath.Abs(cwd)
 	if err != nil {
@@ -640,13 +614,6 @@ func workdirKey(cwd string) string {
 		key = strings.ToLower(key)
 	}
 	return key
-}
-
-func (a *AgyAgent) registerWorkdir(cwd string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.workdirs[workdirKey(cwd)]++
 }
 
 func (a *AgyAgent) unregisterWorkdir(cwd string) bool {

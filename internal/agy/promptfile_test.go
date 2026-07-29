@@ -167,7 +167,6 @@ func TestPromptFileWriter_ConcurrentInstancesInDifferentRepos(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, len(writers))
 	for instance := range writers {
-		instance := instance
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -179,8 +178,12 @@ func TestPromptFileWriter_ConcurrentInstancesInDifferentRepos(t *testing.T) {
 					return
 				}
 				data, err := os.ReadFile(path)
-				if err != nil || string(data) != content {
-					errs <- fmt.Errorf("instance %d turn %d: content=%q err=%v", instance, turn, data, err)
+				if err != nil {
+					errs <- fmt.Errorf("instance %d turn %d: read prompt: %w", instance, turn, err)
+					return
+				}
+				if string(data) != content {
+					errs <- fmt.Errorf("instance %d turn %d: content=%q, want %q", instance, turn, data, content)
 					return
 				}
 			}

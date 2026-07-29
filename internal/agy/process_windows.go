@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -41,7 +42,7 @@ type processTreeController struct {
 }
 
 func init() {
-	if os.Getenv(processHelperEnv) != "1" {
+	if os.Getenv(processHelperEnv) != "1" || os.Getenv(processSpecEnv) == "" || os.Getenv(processGateEnv) == "" {
 		return
 	}
 	os.Exit(runProcessHelper())
@@ -50,6 +51,7 @@ func init() {
 func runProcessHelper() int {
 	var spec helperProcessSpec
 	if err := json.Unmarshal([]byte(os.Getenv(processSpecEnv)), &spec); err != nil {
+		fmt.Fprintf(os.Stderr, "go-agy process helper: invalid spec: %v\n", err)
 		return 125
 	}
 	gate := os.Getenv(processGateEnv)
@@ -59,6 +61,7 @@ func runProcessHelper() int {
 			break
 		}
 		if time.Now().After(deadline) {
+			fmt.Fprintln(os.Stderr, "go-agy process helper: gate wait timed out")
 			return 124
 		}
 		time.Sleep(processGateWait)
@@ -74,12 +77,14 @@ func runProcessHelper() int {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode()
 		}
+		fmt.Fprintf(os.Stderr, "go-agy process helper: execute command: %v\n", err)
 		return 126
 	}
 	return 0
 }
 
 func configureProcessTree(cmd *exec.Cmd) (*processTreeController, error) {
+	cmd.WaitDelay = 5 * time.Second
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, err
