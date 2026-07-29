@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 checker="$repo_root/scripts/check-release-clean.sh"
+remote_name="${1:?missing remote name}"
 zero="0000000000000000000000000000000000000000"
 commits=()
 
@@ -19,10 +20,10 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
 	[[ "$local_sha" == "$zero" ]] && continue
 
 	if [[ "$remote_sha" == "$zero" ]]; then
-		# On a new branch, inspect commits not already reachable from a remote ref.
+		# Exclude only commits already reachable at the push destination.
 		while read -r commit; do
 			add_commit "$commit"
-		done < <(git rev-list --reverse "$local_sha" --not --remotes)
+		done < <(git rev-list --reverse "$local_sha" --not "--remotes=$remote_name")
 	else
 		while read -r commit; do
 			add_commit "$commit"
