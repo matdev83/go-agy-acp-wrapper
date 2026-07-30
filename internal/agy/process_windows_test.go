@@ -5,6 +5,8 @@ package agy
 import (
 	"os/exec"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestHideWindow(t *testing.T) {
@@ -15,5 +17,8 @@ func TestHideWindow(t *testing.T) {
 	}
 	if !cmd.SysProcAttr.HideWindow {
 		t.Error("expected HideWindow to be true")
+	}
+	if cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Error("expected CREATE_NO_WINDOW flag to be set")
 	}
 }

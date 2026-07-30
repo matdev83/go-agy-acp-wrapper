@@ -168,16 +168,17 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		if chunk == "" {
 			return
 		}
-		streamedMu.Lock()
-		streamedBuf.WriteString(chunk)
-		streamedMu.Unlock()
-
 		if err := a.conn.SessionUpdate(promptCtx, acp.SessionNotification{
 			SessionId: params.SessionId,
 			Update:    acp.UpdateAgentMessageText(chunk),
 		}); err != nil {
 			slog.Warn("send streamed session update failed", "sessionId", sid, "error", err)
+			return
 		}
+
+		streamedMu.Lock()
+		streamedBuf.WriteString(chunk)
+		streamedMu.Unlock()
 	})
 	if err != nil {
 		if promptCtx.Err() == context.Canceled {
@@ -192,12 +193,8 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	streamedText := streamedBuf.String()
 	streamedMu.Unlock()
 
-	var tail string
-	if streamedText == "" {
-		tail = response
-	} else if strings.HasPrefix(response, streamedText) {
-		tail = response[len(streamedText):]
-	} else if len(response) > len(streamedText) {
+	tail := response
+	if streamedText != "" && strings.HasPrefix(response, streamedText) {
 		tail = response[len(streamedText):]
 	}
 
