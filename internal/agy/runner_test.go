@@ -113,6 +113,46 @@ func TestNonInteractiveRunner_Execute_SuccessfulCommand(t *testing.T) {
 	}
 }
 
+func TestNonInteractiveRunner_Execute_QuotaErrorIsDescriptive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based exit test is Unix-only")
+	}
+
+	script := filepath.Join(t.TempDir(), "quota.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'RESOURCE_EXHAUSTED: Gemini quota exceeded' >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	r := NewNonInteractiveRunner(script, t.TempDir())
+	resp, err := r.Execute(context.Background(), ExecuteOpts{Cwd: t.TempDir(), Prompt: "hello"})
+	if err == nil {
+		t.Fatal("expected quota error")
+	}
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit classification, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "quota or rate limit was exceeded") || !strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+		t.Fatalf("expected descriptive quota error, got %v", err)
+	}
+	if resp == nil || resp.ExitCode != 1 {
+		t.Fatalf("expected exit code 1 response, got %#v", resp)
+	}
+}
+
+func TestIsProviderLimitError_DetectsAgyTokenExhaustion(t *testing.T) {
+	err := &ProcessError{ExitCode: 1, Detail: "No weighted tokens left for Gemini models"}
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected token exhaustion classification for %v", err)
+	}
+}
+
+func TestIsProviderLimitError_DoesNotClassifyUnrelatedFailure(t *testing.T) {
+	err := &ProcessError{ExitCode: 1, Detail: "authentication failed"}
+	if IsProviderLimitError(err) {
+		t.Fatalf("unexpected provider limit classification for %v", err)
+	}
+}
+
 func TestNonInteractiveRunner_Execute_ContextCancelled(t *testing.T) {
 	var binary string
 	if runtime.GOOS == "windows" {

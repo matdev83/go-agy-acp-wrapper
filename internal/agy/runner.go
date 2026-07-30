@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,6 +31,44 @@ type Response struct {
 	Output   string
 	ExitCode int
 	TimedOut bool
+}
+
+// ProcessError preserves a failed agy invocation as a user-facing provider error.
+type ProcessError struct {
+	ExitCode int
+	Detail   string
+}
+
+func (e *ProcessError) Error() string {
+	detail := strings.TrimSpace(e.Detail)
+	if IsProviderLimitError(e) {
+		if detail == "" {
+			return "agy model provider quota or rate limit was exceeded"
+		}
+		return fmt.Sprintf("agy model provider quota or rate limit was exceeded: %s", detail)
+	}
+	if detail == "" {
+		return fmt.Sprintf("agy request failed (exit code %d)", e.ExitCode)
+	}
+	return fmt.Sprintf("agy request failed (exit code %d): %s", e.ExitCode, detail)
+}
+
+func IsProviderLimitError(err error) bool {
+	var processErr *ProcessError
+	if !errors.As(err, &processErr) {
+		return false
+	}
+	message := strings.ToLower(processErr.Detail)
+	for _, marker := range []string{
+		"quota", "resource_exhausted", "resource exhausted", "rate limit",
+		"too many requests", "usage limit", "limit reached", "status 429", "code 429",
+		"weighted tokens", "tokens remaining", "tokens left", "out of tokens",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 type Runner interface {
@@ -202,10 +241,17 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			response.ExitCode = exitErr.ExitCode()
-			if response.Output == "" {
-				response.Output = normalizeLineEndings(stderr.String())
+			detail := normalizeLineEndings(stderr.String())
+			if strings.TrimSpace(detail) == "" {
+				detail = response.Output
+			} else if IsProviderLimitError(&ProcessError{Detail: response.Output}) &&
+				!IsProviderLimitError(&ProcessError{Detail: detail}) {
+				detail = strings.TrimSpace(detail) + "\n" + strings.TrimSpace(response.Output)
 			}
-			return response, fmt.Errorf("agy exited with code %d: %s", response.ExitCode, stderr.String())
+			if response.Output == "" {
+				response.Output = detail
+			}
+			return response, &ProcessError{ExitCode: response.ExitCode, Detail: detail}
 		}
 		return nil, fmt.Errorf("failed to execute agy: %w", err)
 	}
