@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 
 	"github.com/matdev83/go-agy-acp-wrapper/internal/acp"
+	"github.com/matdev83/go-agy-acp-wrapper/internal/agy"
 	"github.com/matdev83/go-agy-acp-wrapper/internal/config"
 )
 
@@ -38,8 +40,29 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
+	if opts.ListModels {
+		if err := printModels(ctx, cfg.AgyBinary, os.Stdout); err != nil {
+			slog.Error("failed to list models", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := acp.Serve(ctx, cfg, os.Stdin, os.Stdout); err != nil {
 		slog.Error("agent server exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func printModels(ctx context.Context, agyBinary string, output io.Writer) error {
+	catalog := agy.NewStrictModelCatalog(agyBinary)
+	if err := catalog.EnsureLoaded(ctx); err != nil {
+		return err
+	}
+	for _, model := range catalog.Models() {
+		if _, err := fmt.Fprintln(output, model.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

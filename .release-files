@@ -13,6 +13,7 @@ README.md
 SECURITY.md
 cmd/acp-smoke/main.go
 cmd/go-agy-acp-wrapper/main.go
+cmd/go-agy-acp-wrapper/main_test.go
 go.mod
 go.sum
 internal/acp/agent.go

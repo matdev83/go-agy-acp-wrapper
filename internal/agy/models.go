@@ -32,7 +32,8 @@ type ModelProfile struct {
 // ModelCatalog discovers available models from agy and caches the normalized
 // profiles for the lifetime of the catalog instance.
 type ModelCatalog struct {
-	binary string
+	binary        string
+	allowFallback bool
 
 	mu           sync.RWMutex
 	once         sync.Once
@@ -53,6 +54,12 @@ var fallbackModelIDs = []string{
 }
 
 func NewModelCatalog(binary string) *ModelCatalog {
+	return &ModelCatalog{binary: binary, allowFallback: true}
+}
+
+// NewStrictModelCatalog constructs a catalog that reports discovery failures
+// instead of advertising baked-in fallback models.
+func NewStrictModelCatalog(binary string) *ModelCatalog {
 	return &ModelCatalog{binary: binary}
 }
 
@@ -89,9 +96,15 @@ func (c *ModelCatalog) load(ctx context.Context) error {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
+		if !c.allowFallback {
+			return err
+		}
 		slog.Warn("agy model discovery failed, using fallback list", "error", err)
 		ids = fallbackModelIDs
 	} else if len(ids) == 0 {
+		if !c.allowFallback {
+			return fmt.Errorf("agy model discovery returned no models")
+		}
 		slog.Warn("agy model discovery returned no models, using fallback list")
 		ids = fallbackModelIDs
 	} else {
@@ -99,6 +112,9 @@ func (c *ModelCatalog) load(ctx context.Context) error {
 	}
 	profiles := normalizeModelIDs(ids)
 	if len(profiles) == 0 {
+		if !c.allowFallback {
+			return fmt.Errorf("agy model discovery produced no recognized models")
+		}
 		slog.Warn("agy model discovery produced no recognized models, using fallback list")
 		profiles = normalizeModelIDs(fallbackModelIDs)
 	}

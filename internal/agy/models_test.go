@@ -91,6 +91,16 @@ func TestModelCatalogFallback(t *testing.T) {
 	}
 }
 
+func TestStrictModelCatalogRejectsDiscoveryFailure(t *testing.T) {
+	catalog := NewStrictModelCatalog("nonexistent-binary-xyz")
+	if err := catalog.EnsureLoaded(context.Background()); err == nil {
+		t.Fatal("expected strict discovery to fail")
+	}
+	if got := catalog.Models(); len(got) != 0 {
+		t.Fatalf("strict catalog published fallback models: %#v", got)
+	}
+}
+
 func writeModelsScript(t *testing.T, output string) string {
 	t.Helper()
 	dir := t.TempDir()

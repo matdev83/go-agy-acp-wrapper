@@ -58,6 +58,26 @@ func TestParseCLIOptions_Version(t *testing.T) {
 	}
 }
 
+func TestParseCLIOptions_ListModels(t *testing.T) {
+	opts, showVersion, err := ParseCLIOptions([]string{
+		"--list-models",
+		"--agy-binary",
+		"custom-agy",
+	})
+	if err != nil {
+		t.Fatalf("ParseCLIOptions failed: %v", err)
+	}
+	if showVersion {
+		t.Fatal("did not expect version mode")
+	}
+	if !opts.ListModels {
+		t.Fatal("expected list-models mode")
+	}
+	if opts.AgyBinary != "custom-agy" {
+		t.Fatalf("unexpected agy binary: %q", opts.AgyBinary)
+	}
+}
+
 func TestLoadWithOptions_OverridesEnv(t *testing.T) {
 	t.Setenv("AGY_BINARY", "env-agy")
 	t.Setenv("AGY_MODEL", "env-model")
