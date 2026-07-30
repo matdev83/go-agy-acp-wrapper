@@ -31,6 +31,7 @@ type CLIOptions struct {
 	PromptThreshold int
 	TimeoutSeconds  int
 	SkipPerms       *bool
+	ListModels      bool
 }
 
 func Load() (*Config, error) {
@@ -85,6 +86,7 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	fs.BoolVar(&skipPerms, "skip-permissions", false, "pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&noSkipPerms, "no-skip-permissions", false, "do not pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&version, "version", false, "print version and exit")
+	fs.BoolVar(&opts.ListModels, "list-models", false, "print canonical model IDs and exit")
 
 	if err := fs.Parse(args); err != nil {
 		return CLIOptions{}, false, err
