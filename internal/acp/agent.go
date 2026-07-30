@@ -164,21 +164,24 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 
 	var streamedMu sync.Mutex
 	var streamedBuf strings.Builder
-	response, err := a.executeTurn(promptCtx, sess, promptText, func(chunk string) {
-		if chunk == "" {
+	response, err := a.executeTurn(promptCtx, sess, promptText, func(event agy.StreamEvent) {
+		update, ok := streamEventUpdate(event)
+		if !ok {
 			return
 		}
 		if err := a.conn.SessionUpdate(promptCtx, acp.SessionNotification{
 			SessionId: params.SessionId,
-			Update:    acp.UpdateAgentMessageText(chunk),
+			Update:    update,
 		}); err != nil {
 			slog.Warn("send streamed session update failed", "sessionId", sid, "error", err)
 			return
 		}
 
-		streamedMu.Lock()
-		streamedBuf.WriteString(chunk)
-		streamedMu.Unlock()
+		if event.Kind == agy.StreamEventText {
+			streamedMu.Lock()
+			streamedBuf.WriteString(event.Text)
+			streamedMu.Unlock()
+		}
 	})
 	if err != nil {
 		if promptCtx.Err() == context.Canceled {
@@ -210,7 +213,7 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
-func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promptText string, onStdout func(string)) (string, error) {
+func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promptText string, onEvent func(agy.StreamEvent)) (string, error) {
 	mode := sess.GetMode()
 	convID := sess.GetConversationID()
 	turnCount := sess.GetTurnCount()
@@ -229,7 +232,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 
 	switch {
 	case mode == session.ModeFallbackContext:
-		return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
+		return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 
 	case convID != "" && turnCount > 1:
 		opts.ConversationID = convID
@@ -243,14 +246,14 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			opts.Prompt = ""
 		}
 
-		resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
+		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
 		if err != nil {
 			if agy.IsProviderLimitError(err) {
 				return "", err
 			}
 			slog.Warn("native conversation failed, switching to fallback", "error", err, "sessionId", sess.ID)
 			sess.SwitchToFallback()
-			return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
+			return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 		}
 		return resp.Output, nil
 
@@ -259,7 +262,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		if err != nil {
 			slog.Warn("conversation cache snapshot failed, using fallback context", "error", err, "sessionId", sess.ID)
 			sess.SwitchToFallback()
-			return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
+			return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 		}
 		startedAt := time.Now()
 		opts.Prompt = promptText
@@ -272,7 +275,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			opts.Prompt = ""
 		}
 
-		resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
+		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
 		if err != nil {
 			return "", err
 		}
@@ -290,7 +293,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 	}
 }
 
-func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string, onStdout func(string)) (string, error) {
+func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string, onEvent func(agy.StreamEvent)) (string, error) {
 	transcript := sess.GetTranscript()
 	turnCount := sess.GetTurnCount()
 	if len(transcript) > 0 && transcript[len(transcript)-1].Role == session.RoleUser && transcript[len(transcript)-1].Content == promptText {
@@ -306,11 +309,43 @@ func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Contex
 	opts.Prompt = ""
 	opts.PromptFilePath = contextPath
 
-	resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
+	resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
 	if err != nil {
 		return "", err
 	}
 	return resp.Output, nil
+}
+
+func streamEventUpdate(event agy.StreamEvent) (acp.SessionUpdate, bool) {
+	switch event.Kind {
+	case agy.StreamEventText:
+		if event.Text == "" {
+			return acp.SessionUpdate{}, false
+		}
+		return acp.UpdateAgentMessageText(event.Text), true
+	case agy.StreamEventToolStart:
+		title := event.ToolName
+		if title == "" {
+			title = "AGY tool"
+		}
+		opts := []acp.ToolCallStartOpt{acp.WithStartStatus(acp.ToolCallStatusInProgress)}
+		if event.RawInput != nil {
+			opts = append(opts, acp.WithStartRawInput(event.RawInput))
+		}
+		return acp.StartToolCall(acp.ToolCallId(event.ToolID), title, opts...), true
+	case agy.StreamEventToolUpdate:
+		status := acp.ToolCallStatusCompleted
+		if event.ToolState != "DONE" {
+			status = acp.ToolCallStatusFailed
+		}
+		opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
+		if event.RawOutput != nil {
+			opts = append(opts, acp.WithUpdateRawOutput(event.RawOutput))
+		}
+		return acp.UpdateToolCall(acp.ToolCallId(event.ToolID), opts...), true
+	default:
+		return acp.SessionUpdate{}, false
+	}
 }
 
 func (a *AgyAgent) discoverAndSetConversationID(ctx context.Context, sess *session.Context, previousID string, startedAt time.Time) bool {

@@ -14,7 +14,8 @@ import (
 )
 
 type smokeClient struct {
-	updates []string
+	updates     []string
+	toolUpdates int
 }
 
 func (c *smokeClient) ReadTextFile(ctx context.Context, params acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
@@ -46,8 +47,10 @@ func (c *smokeClient) SessionUpdate(ctx context.Context, params acp.SessionNotif
 			fmt.Printf("  [agent] %s\n", text)
 		}
 	case u.ToolCall != nil:
+		c.toolUpdates++
 		fmt.Printf("  [tool_call] %s\n", u.ToolCall.Title)
 	case u.ToolCallUpdate != nil:
+		c.toolUpdates++
 		fmt.Printf("  [tool_update] %s\n", u.ToolCallUpdate.ToolCallId)
 	}
 	return nil
@@ -149,7 +152,7 @@ func main() {
 	fmt.Printf("OK (session=%s)\n", sessResp.SessionId)
 
 	prompts := []string{
-		"Say hello in one sentence.",
+		"Use a read-only command to print the current date, then report it in one sentence.",
 		"Now say goodbye in one sentence.",
 		"What was the first thing I asked you?",
 	}
@@ -181,4 +184,5 @@ func main() {
 
 	fmt.Printf("\n=== SMOKE TEST PASSED ===\n")
 	fmt.Printf("Total updates received: %d\n", len(client.updates))
+	fmt.Printf("Total tool updates received: %d\n", client.toolUpdates)
 }
