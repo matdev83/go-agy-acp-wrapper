@@ -326,7 +326,7 @@ func (stubRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Respo
 	return &agy.Response{Output: "ok"}, nil
 }
 
-func (stubRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+func (stubRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
 	return stubRunner{}.Execute(ctx, opts)
 }
 
@@ -339,7 +339,7 @@ func (r *errorRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.R
 	return r.ExecuteStream(ctx, opts, nil)
 }
 
-func (r *errorRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+func (r *errorRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
 	r.calls++
 	return nil, r.err
 }
@@ -403,7 +403,7 @@ func (r *blockingRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*ag
 	return r.ExecuteStream(ctx, opts, nil)
 }
 
-func (r *blockingRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+func (r *blockingRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
 	r.once.Do(func() { close(r.started) })
 	<-ctx.Done()
 	close(r.cancelled)
@@ -429,7 +429,7 @@ func (r *slowCancelRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*
 	return r.ExecuteStream(ctx, opts, nil)
 }
 
-func (r *slowCancelRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+func (r *slowCancelRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
 	r.once.Do(func() { close(r.started) })
 	<-ctx.Done()
 	close(r.cancelled)
@@ -745,9 +745,9 @@ func (conversationStreamRunner) Execute(ctx context.Context, opts agy.ExecuteOpt
 	return conversationStreamRunner{}.ExecuteStream(ctx, opts, nil)
 }
 
-func (conversationStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
-	if onStdout != nil {
-		onStdout("streamed")
+func (conversationStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
+	if onEvent != nil {
+		onEvent(agy.StreamEvent{Kind: agy.StreamEventText, Text: "streamed"})
 	}
 	return &agy.Response{Output: "streamed", ConversationID: "conv-from-stream"}, nil
 }
@@ -775,6 +775,36 @@ func TestAgyAgent_FirstTurnUsesConversationIDFromAgyStream(t *testing.T) {
 	}
 	if sess.GetMode() != session.ModeNativeConversation {
 		t.Fatal("stream conversation ID unexpectedly switched session to fallback")
+	}
+}
+
+func TestStreamEventUpdate_MapsToolLifecycle(t *testing.T) {
+	start, ok := streamEventUpdate(agy.StreamEvent{
+		Kind:     agy.StreamEventToolStart,
+		ToolID:   "agy-step-3",
+		ToolName: "run_command",
+		RawInput: map[string]any{"CommandLine": "git status"},
+	})
+	if !ok || start.ToolCall == nil {
+		t.Fatalf("expected ACP tool call start, got %#v", start)
+	}
+	if start.ToolCall.ToolCallId != "agy-step-3" || start.ToolCall.Status != acp.ToolCallStatusInProgress {
+		t.Fatalf("unexpected tool call start: %#v", start.ToolCall)
+	}
+
+	done, ok := streamEventUpdate(agy.StreamEvent{
+		Kind:      agy.StreamEventToolUpdate,
+		ToolID:    "agy-step-3",
+		ToolState: "DONE",
+		RawOutput: "clean",
+	})
+	if !ok || done.ToolCallUpdate == nil {
+		t.Fatalf("expected ACP tool call completion, got %#v", done)
+	}
+	if done.ToolCallUpdate.ToolCallId != "agy-step-3" ||
+		done.ToolCallUpdate.Status == nil ||
+		*done.ToolCallUpdate.Status != acp.ToolCallStatusCompleted {
+		t.Fatalf("unexpected tool call completion: %#v", done.ToolCallUpdate)
 	}
 }
 
@@ -850,9 +880,9 @@ func (r partialStreamRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) 
 	return &agy.Response{Output: r.full}, nil
 }
 
-func (r partialStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
-	if onStdout != nil && r.streamed != "" {
-		onStdout(r.streamed)
+func (r partialStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
+	if onEvent != nil && r.streamed != "" {
+		onEvent(agy.StreamEvent{Kind: agy.StreamEventText, Text: r.streamed})
 	}
 	return &agy.Response{Output: r.full}, nil
 }
@@ -876,9 +906,9 @@ func TestAgyAgent_Prompt_FlushesUnsentTailAtTurnCompletion(t *testing.T) {
 
 	var emittedChunks []string
 	var mu sync.Mutex
-	onStdout := func(chunk string) {
+	onStdout := func(event agy.StreamEvent) {
 		mu.Lock()
-		emittedChunks = append(emittedChunks, chunk)
+		emittedChunks = append(emittedChunks, event.Text)
 		mu.Unlock()
 	}
 

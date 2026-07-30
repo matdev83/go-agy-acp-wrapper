@@ -206,9 +206,9 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-stream","resp
 		_, err := r.ExecuteStream(context.Background(), ExecuteOpts{
 			Cwd:    t.TempDir(),
 			Prompt: "ignored",
-		}, func(chunk string) {
+		}, func(event StreamEvent) {
 			select {
-			case firstChunk <- chunk:
+			case firstChunk <- event.Text:
 			default:
 			}
 		})
@@ -247,8 +247,8 @@ func TestAgyJSONStream_UsesAgentDeltasAndAuthoritativeResult(t *testing.T) {
 
 	var stream agyJSONStream
 	var chunks []string
-	stream.read(strings.NewReader(input), func(chunk string) {
-		chunks = append(chunks, chunk)
+	stream.read(strings.NewReader(input), func(event StreamEvent) {
+		chunks = append(chunks, event.Text)
 	})
 
 	if got := strings.Join(chunks, ""); got != "first part" {
@@ -259,6 +259,29 @@ func TestAgyJSONStream_UsesAgentDeltasAndAuthoritativeResult(t *testing.T) {
 	}
 	if stream.conversationID != "conv-123" {
 		t.Fatalf("expected conversation ID from stream, got %q", stream.conversationID)
+	}
+}
+
+func TestAgyJSONStream_EmitsToolProgressWithoutTextDelta(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"step_update","step_update":{"conversation_id":"conv-123","step_index":7,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"git status"}}}}`,
+		`{"event":"step_update","step_update":{"conversation_id":"conv-123","step_index":7,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","output":"clean"}}}`,
+	}, "\n")
+
+	var stream agyJSONStream
+	var events []StreamEvent
+	stream.read(strings.NewReader(input), func(event StreamEvent) {
+		events = append(events, event)
+	})
+
+	if len(events) != 2 {
+		t.Fatalf("expected tool start and completion, got %#v", events)
+	}
+	if events[0].Kind != StreamEventToolStart || events[0].ToolID != "agy-step-7" || events[0].ToolName != "run_command" {
+		t.Fatalf("unexpected tool start: %#v", events[0])
+	}
+	if events[1].Kind != StreamEventToolUpdate || events[1].ToolState != "DONE" || events[1].RawOutput != "clean" {
+		t.Fatalf("unexpected tool completion: %#v", events[1])
 	}
 }
 

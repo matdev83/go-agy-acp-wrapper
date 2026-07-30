@@ -34,6 +34,24 @@ type Response struct {
 	TimedOut       bool
 }
 
+type StreamEventKind int
+
+const (
+	StreamEventText StreamEventKind = iota
+	StreamEventToolStart
+	StreamEventToolUpdate
+)
+
+type StreamEvent struct {
+	Kind      StreamEventKind
+	Text      string
+	ToolID    string
+	ToolName  string
+	ToolState string
+	RawInput  any
+	RawOutput any
+}
+
 // ProcessError preserves a failed agy invocation as a user-facing provider error.
 type ProcessError struct {
 	ExitCode int
@@ -74,7 +92,7 @@ func IsProviderLimitError(err error) bool {
 
 type Runner interface {
 	Execute(ctx context.Context, opts ExecuteOpts) (*Response, error)
-	ExecuteStream(ctx context.Context, opts ExecuteOpts, onStdout func(string)) (*Response, error)
+	ExecuteStream(ctx context.Context, opts ExecuteOpts, onEvent func(StreamEvent)) (*Response, error)
 }
 
 type NonInteractiveRunner struct {
@@ -92,7 +110,7 @@ func (r *NonInteractiveRunner) Execute(ctx context.Context, opts ExecuteOpts) (*
 	return r.ExecuteStream(ctx, opts, nil)
 }
 
-func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOpts, onStdout func(string)) (*Response, error) {
+func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOpts, onEvent func(StreamEvent)) (*Response, error) {
 	args := r.buildArgs(opts)
 	slog.Debug("executing agy", "binary", r.binary, "args", args, "cwd", opts.Cwd)
 
@@ -137,7 +155,7 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	readers.Add(2)
 	go func() {
 		defer readers.Done()
-		stream.read(stdoutPipe, onStdout)
+		stream.read(stdoutPipe, onEvent)
 	}()
 	go func() {
 		defer readers.Done()
@@ -198,7 +216,7 @@ type agyJSONStream struct {
 	conversationID string
 }
 
-func (s *agyJSONStream) read(r io.Reader, onChunk func(string)) {
+func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
@@ -211,8 +229,16 @@ func (s *agyJSONStream) read(r io.Reader, onChunk func(string)) {
 			ConversationID string `json:"conversation_id"`
 			StepUpdate     struct {
 				ConversationID string `json:"conversation_id"`
+				StepIndex      int    `json:"step_index"`
+				State          string `json:"state"`
 				StepType       string `json:"step_type"`
 				TextDelta      string `json:"text_delta"`
+				ToolName       string `json:"tool_name"`
+				ToolInfo       struct {
+					Name       string `json:"name"`
+					Parameters any    `json:"parameters"`
+					Output     any    `json:"output"`
+				} `json:"tool_info"`
 			} `json:"step_update"`
 			Result struct {
 				ConversationID string `json:"conversation_id"`
@@ -232,9 +258,28 @@ func (s *agyJSONStream) read(r io.Reader, onChunk func(string)) {
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				chunk := normalizeLineEndings(event.StepUpdate.TextDelta)
 				s.streamed.WriteString(chunk)
-				if onChunk != nil {
-					onChunk(chunk)
+				if onEvent != nil {
+					onEvent(StreamEvent{Kind: StreamEventText, Text: chunk})
 				}
+			}
+			if event.StepUpdate.StepType == "tool" && onEvent != nil {
+				toolName := event.StepUpdate.ToolName
+				if toolName == "" {
+					toolName = event.StepUpdate.ToolInfo.Name
+				}
+				streamEvent := StreamEvent{
+					ToolID:    fmt.Sprintf("agy-step-%d", event.StepUpdate.StepIndex),
+					ToolName:  toolName,
+					ToolState: event.StepUpdate.State,
+					RawInput:  event.StepUpdate.ToolInfo.Parameters,
+					RawOutput: event.StepUpdate.ToolInfo.Output,
+				}
+				if event.StepUpdate.State == "ACTIVE" {
+					streamEvent.Kind = StreamEventToolStart
+				} else {
+					streamEvent.Kind = StreamEventToolUpdate
+				}
+				onEvent(streamEvent)
 			}
 		case "result":
 			if event.Result.ConversationID != "" {
