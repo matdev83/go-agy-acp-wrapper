@@ -184,7 +184,7 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		if promptCtx.Err() == context.Canceled {
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 		}
-		return acp.PromptResponse{}, err
+		return acp.PromptResponse{}, promptRequestError(err)
 	}
 
 	sess.AddAssistantMessage(response)
@@ -245,6 +245,9 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 
 		resp, err := a.runner.ExecuteStream(ctx, opts, onStdout)
 		if err != nil {
+			if agy.IsProviderLimitError(err) {
+				return "", err
+			}
 			slog.Warn("native conversation failed, switching to fallback", "error", err, "sessionId", sess.ID)
 			sess.SwitchToFallback()
 			return a.executeFallbackTurn(ctx, sess, opts, promptText, onStdout)
@@ -667,6 +670,22 @@ func Serve(ctx context.Context, cfg *config.Config, input io.Reader, output io.W
 		return nil
 	case <-conn.Done():
 		return nil
+	}
+}
+
+const providerLimitErrorCode = -32003
+
+func promptRequestError(err error) error {
+	message := "Agy request failed"
+	code := -32001
+	if agy.IsProviderLimitError(err) {
+		message = "Model provider quota or rate limit exceeded"
+		code = providerLimitErrorCode
+	}
+	return &acp.RequestError{
+		Code:    code,
+		Message: message,
+		Data:    map[string]any{"error": err.Error()},
 	}
 }
 

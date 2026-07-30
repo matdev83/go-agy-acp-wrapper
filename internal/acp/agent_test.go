@@ -330,6 +330,62 @@ func (stubRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStd
 	return stubRunner{}.Execute(ctx, opts)
 }
 
+type errorRunner struct {
+	err   error
+	calls int
+}
+
+func (r *errorRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return r.ExecuteStream(ctx, opts, nil)
+}
+
+func (r *errorRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+	r.calls++
+	return nil, r.err
+}
+
+func TestAgyAgent_Prompt_ReturnsDescriptiveQuotaRequestError(t *testing.T) {
+	agent := newTestAgent(t)
+	runner := &errorRunner{err: &agy.ProcessError{
+		ExitCode: 1,
+		Detail:   "RESOURCE_EXHAUSTED: Gemini quota exceeded for this account",
+	}}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	sess, ok := agent.store.Get(string(sessResp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	sess.SetConversationID("conv-123")
+	sess.AddUserMessage("previous")
+	sess.AddAssistantMessage("answer")
+
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("next")},
+	})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("expected ACP request error, got %T: %v", err, err)
+	}
+	if requestErr.Code != -32003 || requestErr.Message != "Model provider quota or rate limit exceeded" {
+		t.Fatalf("unexpected request error: %#v", requestErr)
+	}
+	if !strings.Contains(fmt.Sprint(requestErr.Data), "Gemini quota exceeded") {
+		t.Fatalf("expected provider detail in request error data: %#v", requestErr.Data)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("quota failure should not be retried in fallback mode; got %d calls", runner.calls)
+	}
+	if sess.GetMode() != session.ModeNativeConversation {
+		t.Fatal("quota failure unexpectedly switched session to fallback mode")
+	}
+}
+
 type blockingRunner struct {
 	started   chan struct{}
 	cancelled chan struct{}
