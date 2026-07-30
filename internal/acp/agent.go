@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -163,18 +162,23 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	}
 	sess.AddUserMessage(promptText)
 
-	var streamed atomic.Bool
+	var streamedMu sync.Mutex
+	var streamedBuf strings.Builder
 	response, err := a.executeTurn(promptCtx, sess, promptText, func(chunk string) {
 		if chunk == "" {
 			return
 		}
-		streamed.Store(true)
 		if err := a.conn.SessionUpdate(promptCtx, acp.SessionNotification{
 			SessionId: params.SessionId,
 			Update:    acp.UpdateAgentMessageText(chunk),
 		}); err != nil {
 			slog.Warn("send streamed session update failed", "sessionId", sid, "error", err)
+			return
 		}
+
+		streamedMu.Lock()
+		streamedBuf.WriteString(chunk)
+		streamedMu.Unlock()
 	})
 	if err != nil {
 		if promptCtx.Err() == context.Canceled {
@@ -185,10 +189,19 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 
 	sess.AddAssistantMessage(response)
 
-	if !streamed.Load() && response != "" {
+	streamedMu.Lock()
+	streamedText := streamedBuf.String()
+	streamedMu.Unlock()
+
+	tail := response
+	if streamedText != "" && strings.HasPrefix(response, streamedText) {
+		tail = response[len(streamedText):]
+	}
+
+	if tail != "" {
 		if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
 			SessionId: params.SessionId,
-			Update:    acp.UpdateAgentMessageText(response),
+			Update:    acp.UpdateAgentMessageText(tail),
 		}); err != nil {
 			return acp.PromptResponse{}, fmt.Errorf("send session update: %w", err)
 		}

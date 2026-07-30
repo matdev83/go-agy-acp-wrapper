@@ -27,7 +27,9 @@ internal/agy/models_test.go
 internal/agy/promptfile.go
 internal/agy/promptfile_test.go
 internal/agy/process_unix.go
+internal/agy/process_unix_test.go
 internal/agy/process_windows.go
+internal/agy/process_windows_test.go
 internal/agy/runner.go
 internal/agy/runner_test.go
 internal/agy/signal_unix.go

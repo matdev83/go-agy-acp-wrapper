@@ -42,7 +42,7 @@ type NonInteractiveRunner struct {
 	configDir string
 }
 
-const transcriptPollInterval = 250 * time.Millisecond
+const transcriptPollInterval = 50 * time.Millisecond
 
 func NewNonInteractiveRunner(binary, configDir string) *NonInteractiveRunner {
 	return &NonInteractiveRunner{binary: binary, configDir: configDir}
@@ -69,14 +69,52 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	var tailer *transcriptTailer
 	var tailStop chan struct{}
 	var stopTailerOnce sync.Once
-	streamChunk := onStdout
-	if onStdout != nil && r.configDir != "" && opts.ConversationID != "" {
-		tailStop = make(chan struct{})
-		streamChunk = func(chunk string) {
-			onStdout(chunk)
-			stopTailerOnce.Do(func() { close(tailStop) })
+
+	var modeMu sync.Mutex
+	activeMode := "none"
+
+	onStdoutChunk := func(chunk string) {
+		if chunk == "" {
+			return
 		}
-		tailer = newTranscriptTailer(r.configDir, opts.ConversationID, startedAt, streamChunk)
+		modeMu.Lock()
+		if activeMode == "tailer" {
+			modeMu.Unlock()
+			return
+		}
+		activeMode = "stdout"
+		modeMu.Unlock()
+
+		stopTailerOnce.Do(func() {
+			if tailStop != nil {
+				close(tailStop)
+			}
+		})
+		if onStdout != nil {
+			onStdout(chunk)
+		}
+	}
+
+	onTailerChunk := func(chunk string) {
+		if chunk == "" {
+			return
+		}
+		modeMu.Lock()
+		if activeMode == "stdout" {
+			modeMu.Unlock()
+			return
+		}
+		activeMode = "tailer"
+		modeMu.Unlock()
+
+		if onStdout != nil {
+			onStdout(chunk)
+		}
+	}
+
+	if onStdout != nil && r.configDir != "" {
+		tailStop = make(chan struct{})
+		tailer = newTranscriptTailer(r.configDir, opts.ConversationID, startedAt, onTailerChunk)
 		tailer.snapshotExisting()
 	}
 
@@ -115,7 +153,7 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	readers.Add(2)
 	go func() {
 		defer readers.Done()
-		streamPipeLines(stdoutPipe, &stdout, streamChunk)
+		streamPipeLines(stdoutPipe, &stdout, onStdoutChunk)
 	}()
 	go func() {
 		defer readers.Done()
@@ -134,15 +172,21 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	err = cmd.Wait()
 	readers.Wait()
 	if tailer != nil {
-		stopTailerOnce.Do(func() { close(tailStop) })
+		stopTailerOnce.Do(func() {
+			if tailStop != nil {
+				close(tailStop)
+			}
+		})
 		<-tailDone
-		tailer.scan()
+		tailer.scan(true)
 	}
 
 	response := &Response{
 		Output: normalizeLineEndings(stdout.String()),
 	}
-	if strings.TrimSpace(response.Output) == "" && tailer != nil {
+	if tailer != nil && len(tailer.output()) > len(response.Output) {
+		response.Output = tailer.output()
+	} else if strings.TrimSpace(response.Output) == "" && tailer != nil {
 		response.Output = tailer.output()
 	}
 
@@ -168,9 +212,9 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 
 	response.ExitCode = 0
 
-	if strings.TrimSpace(response.Output) == "" && opts.ConversationID != "" {
-		if extracted := r.extractFromTranscript(opts.ConversationID); extracted != "" {
-			slog.Debug("stdout empty, extracted response from transcript", "conversationId", opts.ConversationID)
+	if opts.ConversationID != "" {
+		if extracted := r.extractFromTranscript(opts.ConversationID); len(extracted) > len(response.Output) {
+			slog.Debug("extracted fuller response from transcript", "conversationId", opts.ConversationID)
 			response.Output = extracted
 		}
 	}
@@ -178,18 +222,46 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	return response, nil
 }
 
-func streamPipeLines(r io.Reader, dst *bytes.Buffer, onLine func(string)) {
-	reader := bufio.NewReader(r)
+func streamPipeLines(r io.Reader, dst *bytes.Buffer, onChunk func(string)) {
+	buf := make([]byte, 4096)
+	var pendingCR bool
 	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			normalized := normalizeLineEndings(line)
-			_, _ = dst.WriteString(normalized)
-			if onLine != nil {
-				onLine(normalized)
+		n, err := r.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			var sb strings.Builder
+			sb.Grow(len(chunk))
+			for _, b := range chunk {
+				if pendingCR {
+					if b == '\n' {
+						sb.WriteByte('\n')
+						pendingCR = false
+						continue
+					}
+					sb.WriteByte('\r')
+					pendingCR = false
+				}
+				if b == '\r' {
+					pendingCR = true
+				} else {
+					sb.WriteByte(b)
+				}
+			}
+			text := sb.String()
+			if text != "" {
+				_, _ = dst.WriteString(text)
+				if onChunk != nil {
+					onChunk(text)
+				}
 			}
 		}
 		if err != nil {
+			if pendingCR {
+				_, _ = dst.WriteString("\r")
+				if onChunk != nil {
+					onChunk("\r")
+				}
+			}
 			return
 		}
 	}
@@ -238,14 +310,14 @@ func (t *transcriptTailer) run(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			t.scan()
+			t.scan(false)
 		}
 	}
 }
 
-func (t *transcriptTailer) scan() {
+func (t *transcriptTailer) scan(isFinal bool) {
 	for _, path := range t.candidateTranscriptPaths() {
-		t.scanFile(path)
+		t.scanFile(path, isFinal)
 	}
 }
 
@@ -272,7 +344,7 @@ func (t *transcriptTailer) candidateTranscriptPaths() []string {
 	return paths
 }
 
-func (t *transcriptTailer) scanFile(path string) {
+func (t *transcriptTailer) scanFile(path string, isFinal bool) {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return
@@ -285,14 +357,14 @@ func (t *transcriptTailer) scanFile(path string) {
 		}
 		state = transcriptFileState{}
 	}
-	if known && info.Size() == state.offset && info.ModTime().Equal(state.modTime) {
+	if known && info.Size() == state.offset && info.ModTime().Equal(state.modTime) && !isFinal {
 		return
 	}
 	if info.Size() < state.offset {
 		state.offset = 0
 	}
 
-	data, nextOffset, err := readCompleteJSONLFrom(path, state.offset)
+	data, nextOffset, err := readJSONLFrom(path, state.offset, isFinal)
 	if err != nil {
 		slog.Debug("tail transcript read failed", "path", path, "error", err)
 		return
@@ -338,7 +410,7 @@ func (t *transcriptTailer) emit(content string) {
 	}
 }
 
-func readCompleteJSONLFrom(path string, offset int64) ([]byte, int64, error) {
+func readJSONLFrom(path string, offset int64, isFinal bool) ([]byte, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, offset, err
@@ -353,9 +425,18 @@ func readCompleteJSONLFrom(path string, offset int64) ([]byte, int64, error) {
 	if err != nil {
 		return nil, offset, err
 	}
+	if len(data) == 0 {
+		return nil, offset, nil
+	}
 	lastNewline := bytes.LastIndexByte(data, '\n')
 	if lastNewline < 0 {
+		if isFinal {
+			return data, offset + int64(len(data)), nil
+		}
 		return nil, offset, nil
+	}
+	if isFinal && lastNewline < len(data)-1 {
+		return data, offset + int64(len(data)), nil
 	}
 	complete := data[:lastNewline+1]
 	return complete, offset + int64(len(complete)), nil

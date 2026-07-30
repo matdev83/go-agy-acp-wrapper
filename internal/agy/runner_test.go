@@ -263,9 +263,9 @@ func TestTranscriptTailer_EmitsOnlyGrowingPlannerSuffix(t *testing.T) {
 	tailer.snapshotExisting()
 
 	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"first"}`+"\n")
-	tailer.scan()
+	tailer.scan(false)
 	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"first second"}`+"\n")
-	tailer.scan()
+	tailer.scan(true)
 
 	if got := strings.Join(chunks, ""); got != "first second" {
 		t.Fatalf("expected chunks to reconstruct content, got %q from %#v", got, chunks)
@@ -293,13 +293,13 @@ func TestTranscriptTailer_IgnoresPartialJSONLLineUntilComplete(t *testing.T) {
 	tailer.snapshotExisting()
 
 	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"partial"}`)
-	tailer.scan()
+	tailer.scan(false)
 	if len(chunks) != 0 {
 		t.Fatalf("expected no chunks for partial line, got %#v", chunks)
 	}
 
 	appendTranscript(t, path, "\n")
-	tailer.scan()
+	tailer.scan(true)
 	if len(chunks) != 1 || chunks[0] != "partial" {
 		t.Fatalf("expected completed line chunk, got %#v", chunks)
 	}
@@ -315,7 +315,7 @@ func TestTranscriptTailer_DiscoversNewTranscriptWithoutConversationID(t *testing
 
 	path := makeTranscriptPath(t, configDir, "conv-discovered")
 	appendTranscript(t, path, `{"type":"PLANNER_RESPONSE","content":"discovered"}`+"\n")
-	tailer.scan()
+	tailer.scan(true)
 
 	if len(chunks) != 1 || chunks[0] != "discovered" {
 		t.Fatalf("expected discovered transcript chunk, got %#v", chunks)

@@ -241,6 +241,7 @@ func (c *ModelCatalog) SupportedEfforts(model string) []string {
 
 func discoverModelIDs(ctx context.Context, binary string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, binary, "models")
+	hideWindow(cmd)
 	cmd.Env = agyEnvironment()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

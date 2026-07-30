@@ -12,6 +12,8 @@ import (
 
 type processTreeController struct{}
 
+func hideWindow(cmd *exec.Cmd) {}
+
 func configureProcessTree(cmd *exec.Cmd) (*processTreeController, error) {
 	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
