@@ -745,3 +745,56 @@ func (a *AgyAgent) promptWriterTestContextPath(cwd, sessionID string, turnCount 
 	}
 	return filepath.Join(instanceDir, sessionID, fmt.Sprintf("context_%d.md", turnCount))
 }
+
+type partialStreamRunner struct {
+	streamed string
+	full     string
+}
+
+func (r partialStreamRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return &agy.Response{Output: r.full}, nil
+}
+
+func (r partialStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+	if onStdout != nil && r.streamed != "" {
+		onStdout(r.streamed)
+	}
+	return &agy.Response{Output: r.full}, nil
+}
+
+func TestAgyAgent_Prompt_FlushesUnsentTailAtTurnCompletion(t *testing.T) {
+	agent := newTestAgent(t)
+
+	sess, err := agent.store.Create(t.TempDir())
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	sess.SetConversationID("conv-123")
+	sess.AddUserMessage("First message")
+	sess.AddAssistantMessage("First answer")
+
+	runner := partialStreamRunner{
+		streamed: "Part 1 streamed ",
+		full:     "Part 1 streamed Part 2 tail delivered",
+	}
+	agent.runner = runner
+
+	var emittedChunks []string
+	var mu sync.Mutex
+	onStdout := func(chunk string) {
+		mu.Lock()
+		emittedChunks = append(emittedChunks, chunk)
+		mu.Unlock()
+	}
+
+	resp, err := agent.executeTurn(context.Background(), sess, "Second question", onStdout)
+	if err != nil {
+		t.Fatalf("executeTurn failed: %v", err)
+	}
+	if resp != runner.full {
+		t.Fatalf("expected full response %q, got %q", runner.full, resp)
+	}
+	if len(emittedChunks) != 1 || emittedChunks[0] != runner.streamed {
+		t.Fatalf("expected streamed chunk %q, got %#v", runner.streamed, emittedChunks)
+	}
+}

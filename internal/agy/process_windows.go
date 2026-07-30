@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -48,6 +49,14 @@ func init() {
 	os.Exit(runProcessHelper())
 }
 
+func hideWindow(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW
+}
+
 func runProcessHelper() int {
 	var spec helperProcessSpec
 	if err := json.Unmarshal([]byte(os.Getenv(processSpecEnv)), &spec); err != nil {
@@ -73,6 +82,7 @@ func runProcessHelper() int {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	hideWindow(cmd)
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode()
@@ -85,6 +95,7 @@ func runProcessHelper() int {
 
 func configureProcessTree(cmd *exec.Cmd) (*processTreeController, error) {
 	cmd.WaitDelay = 5 * time.Second
+	hideWindow(cmd)
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, err
