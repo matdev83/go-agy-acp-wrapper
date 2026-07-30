@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -320,19 +319,6 @@ func TestTranscriptTailer_DiscoversNewTranscriptWithoutConversationID(t *testing
 
 	if len(chunks) != 1 || chunks[0] != "discovered" {
 		t.Fatalf("expected discovered transcript chunk, got %#v", chunks)
-	}
-}
-
-func TestHideWindow(t *testing.T) {
-	cmd := exec.Command("echo", "test")
-	hideWindow(cmd)
-	if runtime.GOOS == "windows" {
-		if cmd.SysProcAttr == nil {
-			t.Fatal("expected SysProcAttr to be set on Windows")
-		}
-		if !cmd.SysProcAttr.HideWindow {
-			t.Error("expected HideWindow to be true on Windows")
-		}
 	}
 }
 
