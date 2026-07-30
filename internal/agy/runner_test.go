@@ -18,7 +18,7 @@ func TestNonInteractiveRunner_BuildArgs_SimplePrompt(t *testing.T) {
 	args := r.buildArgs(ExecuteOpts{
 		Prompt: "hello",
 	})
-	expected := []string{"--print", "hello"}
+	expected := []string{"--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -28,7 +28,7 @@ func TestNonInteractiveRunner_BuildArgs_WithConversation(t *testing.T) {
 		Prompt:         "hello",
 		ConversationID: "abc-123",
 	})
-	expected := []string{"--conversation", "abc-123", "--print", "hello"}
+	expected := []string{"--conversation", "abc-123", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -37,7 +37,7 @@ func TestNonInteractiveRunner_BuildArgs_WithPromptFile(t *testing.T) {
 	args := r.buildArgs(ExecuteOpts{
 		PromptFilePath: "/tmp/prompt.md",
 	})
-	expected := []string{"--print", "@/tmp/prompt.md"}
+	expected := []string{"--output-format", "stream-json", "--print", "@/tmp/prompt.md"}
 	assertArgs(t, expected, args)
 }
 
@@ -47,7 +47,7 @@ func TestNonInteractiveRunner_BuildArgs_WithSkipPerms(t *testing.T) {
 		Prompt:    "hello",
 		SkipPerms: true,
 	})
-	expected := []string{"--dangerously-skip-permissions", "--print", "hello"}
+	expected := []string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -57,7 +57,7 @@ func TestNonInteractiveRunner_BuildArgs_WithModel(t *testing.T) {
 		Prompt: "hello",
 		Model:  "gemini-2.5-pro",
 	})
-	expected := []string{"--model", "gemini-2.5-pro", "--print", "hello"}
+	expected := []string{"--model", "gemini-2.5-pro", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -69,7 +69,7 @@ func TestNonInteractiveRunner_BuildArgs_AllOptions(t *testing.T) {
 		Model:          "Gemini 3.1 Pro (High)",
 		SkipPerms:      true,
 	})
-	expected := []string{"--conversation", "conv-1", "--model", "Gemini 3.1 Pro (High)", "--dangerously-skip-permissions", "--print", "hello"}
+	expected := []string{"--conversation", "conv-1", "--model", "Gemini 3.1 Pro (High)", "--dangerously-skip-permissions", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -187,7 +187,13 @@ func TestNonInteractiveRunner_ExecuteStream_EmitsStdoutBeforeProcessExit(t *test
 	}
 
 	script := filepath.Join(t.TempDir(), "stream.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'first\\n'\nsleep 1\nprintf 'second\\n'\n"), 0700); err != nil {
+	scriptBody := `#!/bin/sh
+printf '%s\n' '{"event":"init","conversation_id":"conv-stream"}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"conv-stream","step_type":"agent_response","text_delta":"first\n"}}'
+sleep 1
+printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-stream","response":"first\nsecond\n"}}'
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0700); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
@@ -227,6 +233,32 @@ func TestNonInteractiveRunner_ExecuteStream_EmitsStdoutBeforeProcessExit(t *test
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("process did not finish")
+	}
+}
+
+func TestAgyJSONStream_UsesAgentDeltasAndAuthoritativeResult(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"init","conversation_id":"conv-123","init":{"model":"test"}}`,
+		`{"event":"step_update","step_update":{"conversation_id":"conv-123","step_type":"user_input","text_delta":"ignored"}}`,
+		`{"event":"step_update","step_update":{"conversation_id":"conv-123","step_type":"agent_response","text_delta":"first "}}`,
+		`{"event":"step_update","step_update":{"conversation_id":"conv-123","step_type":"agent_response","text_delta":"part"}}`,
+		`{"event":"result","result":{"conversation_id":"conv-123","status":"SUCCESS","response":"first part plus final tail"}}`,
+	}, "\n")
+
+	var stream agyJSONStream
+	var chunks []string
+	stream.read(strings.NewReader(input), func(chunk string) {
+		chunks = append(chunks, chunk)
+	})
+
+	if got := strings.Join(chunks, ""); got != "first part" {
+		t.Fatalf("expected only live agent deltas, got %q", got)
+	}
+	if got := stream.output(); got != "first part plus final tail" {
+		t.Fatalf("expected authoritative result response, got %q", got)
+	}
+	if stream.conversationID != "conv-123" {
+		t.Fatalf("expected conversation ID from stream, got %q", stream.conversationID)
 	}
 }
 
