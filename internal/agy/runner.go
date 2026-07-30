@@ -28,9 +28,10 @@ type ExecuteOpts struct {
 }
 
 type Response struct {
-	Output   string
-	ExitCode int
-	TimedOut bool
+	Output         string
+	ConversationID string
+	ExitCode       int
+	TimedOut       bool
 }
 
 // ProcessError preserves a failed agy invocation as a user-facing provider error.
@@ -104,59 +105,6 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	}
 	defer cancel()
 
-	startedAt := time.Now()
-	var tailer *transcriptTailer
-	var tailStop chan struct{}
-	var stopTailerOnce sync.Once
-
-	var modeMu sync.Mutex
-	activeMode := "none"
-
-	onStdoutChunk := func(chunk string) {
-		if chunk == "" {
-			return
-		}
-		modeMu.Lock()
-		if activeMode == "tailer" {
-			modeMu.Unlock()
-			return
-		}
-		activeMode = "stdout"
-		modeMu.Unlock()
-
-		stopTailerOnce.Do(func() {
-			if tailStop != nil {
-				close(tailStop)
-			}
-		})
-		if onStdout != nil {
-			onStdout(chunk)
-		}
-	}
-
-	onTailerChunk := func(chunk string) {
-		if chunk == "" {
-			return
-		}
-		modeMu.Lock()
-		if activeMode == "stdout" {
-			modeMu.Unlock()
-			return
-		}
-		activeMode = "tailer"
-		modeMu.Unlock()
-
-		if onStdout != nil {
-			onStdout(chunk)
-		}
-	}
-
-	if onStdout != nil && r.configDir != "" {
-		tailStop = make(chan struct{})
-		tailer = newTranscriptTailer(r.configDir, opts.ConversationID, startedAt, onTailerChunk)
-		tailer.snapshotExisting()
-	}
-
 	cmd := exec.CommandContext(execCtx, r.binary, args...)
 	cmd.Dir = opts.Cwd
 	cmd.Env = r.commandEnv()
@@ -183,50 +131,25 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("contain agy process tree: %w", err)
 	}
-	if tailer != nil {
-		tailer.startedAt = time.Now()
-	}
-
-	var stdout, stderr bytes.Buffer
+	var stream agyJSONStream
+	var stderr bytes.Buffer
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() {
 		defer readers.Done()
-		streamPipeLines(stdoutPipe, &stdout, onStdoutChunk)
+		stream.read(stdoutPipe, onStdout)
 	}()
 	go func() {
 		defer readers.Done()
 		_, _ = io.Copy(&stderr, stderrPipe)
 	}()
 
-	var tailDone chan struct{}
-	if tailer != nil {
-		tailDone = make(chan struct{})
-		go func() {
-			defer close(tailDone)
-			tailer.run(tailStop)
-		}()
-	}
-
 	err = cmd.Wait()
 	readers.Wait()
-	if tailer != nil {
-		stopTailerOnce.Do(func() {
-			if tailStop != nil {
-				close(tailStop)
-			}
-		})
-		<-tailDone
-		tailer.scan(true)
-	}
 
 	response := &Response{
-		Output: normalizeLineEndings(stdout.String()),
-	}
-	if tailer != nil && len(tailer.output()) > len(response.Output) {
-		response.Output = tailer.output()
-	} else if strings.TrimSpace(response.Output) == "" && tailer != nil {
-		response.Output = tailer.output()
+		Output:         stream.output(),
+		ConversationID: stream.conversationID,
 	}
 
 	if err != nil {
@@ -258,7 +181,7 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 
 	response.ExitCode = 0
 
-	if opts.ConversationID != "" {
+	if response.Output == "" && opts.ConversationID != "" {
 		if extracted := r.extractFromTranscript(opts.ConversationID); len(extracted) > len(response.Output) {
 			slog.Debug("extracted fuller response from transcript", "conversationId", opts.ConversationID)
 			response.Output = extracted
@@ -266,6 +189,70 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	}
 
 	return response, nil
+}
+
+type agyJSONStream struct {
+	raw            bytes.Buffer
+	streamed       strings.Builder
+	result         string
+	conversationID string
+}
+
+func (s *agyJSONStream) read(r io.Reader, onChunk func(string)) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		s.raw.Write(line)
+		s.raw.WriteByte('\n')
+
+		var event struct {
+			Event          string `json:"event"`
+			ConversationID string `json:"conversation_id"`
+			StepUpdate     struct {
+				ConversationID string `json:"conversation_id"`
+				StepType       string `json:"step_type"`
+				TextDelta      string `json:"text_delta"`
+			} `json:"step_update"`
+			Result struct {
+				ConversationID string `json:"conversation_id"`
+				Response       string `json:"response"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		switch event.Event {
+		case "init":
+			s.conversationID = event.ConversationID
+		case "step_update":
+			if event.StepUpdate.ConversationID != "" {
+				s.conversationID = event.StepUpdate.ConversationID
+			}
+			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
+				chunk := normalizeLineEndings(event.StepUpdate.TextDelta)
+				s.streamed.WriteString(chunk)
+				if onChunk != nil {
+					onChunk(chunk)
+				}
+			}
+		case "result":
+			if event.Result.ConversationID != "" {
+				s.conversationID = event.Result.ConversationID
+			}
+			s.result = normalizeLineEndings(event.Result.Response)
+		}
+	}
+}
+
+func (s *agyJSONStream) output() string {
+	if s.result != "" {
+		return s.result
+	}
+	if s.streamed.Len() > 0 {
+		return s.streamed.String()
+	}
+	return normalizeLineEndings(s.raw.String())
 }
 
 func streamPipeLines(r io.Reader, dst *bytes.Buffer, onChunk func(string)) {
@@ -525,7 +512,7 @@ func (r *NonInteractiveRunner) buildArgs(opts ExecuteOpts) []string {
 		args = append(args, "--dangerously-skip-permissions")
 	}
 
-	args = append(args, "--print")
+	args = append(args, "--output-format", "stream-json", "--print")
 	if opts.PromptFilePath != "" {
 		args = append(args, "@"+opts.PromptFilePath)
 	} else {

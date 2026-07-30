@@ -739,6 +739,45 @@ func TestAgyAgent_AttributionFailureSwitchesToFallback(t *testing.T) {
 	}
 }
 
+type conversationStreamRunner struct{}
+
+func (conversationStreamRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return conversationStreamRunner{}.ExecuteStream(ctx, opts, nil)
+}
+
+func (conversationStreamRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onStdout func(string)) (*agy.Response, error) {
+	if onStdout != nil {
+		onStdout("streamed")
+	}
+	return &agy.Response{Output: "streamed", ConversationID: "conv-from-stream"}, nil
+}
+
+func TestAgyAgent_FirstTurnUsesConversationIDFromAgyStream(t *testing.T) {
+	cfg := newTestConfig(t)
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	agent.runner = conversationStreamRunner{}
+
+	resp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, ok := agent.store.Get(string(resp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+
+	if _, err := agent.executeTurn(context.Background(), sess, "first prompt", nil); err != nil {
+		t.Fatalf("executeTurn failed: %v", err)
+	}
+	if got := sess.GetConversationID(); got != "conv-from-stream" {
+		t.Fatalf("expected stream conversation ID, got %q", got)
+	}
+	if sess.GetMode() != session.ModeNativeConversation {
+		t.Fatal("stream conversation ID unexpectedly switched session to fallback")
+	}
+}
+
 func TestAgyAgent_NewSessionCanonicalizesCwdAliases(t *testing.T) {
 	cfg := newTestConfig(t)
 	agent := NewAgyAgent(cfg)

@@ -277,8 +277,13 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			return "", err
 		}
 
-		if convID == "" && !a.discoverAndSetConversationID(ctx, sess, previousID, startedAt) {
-			sess.SwitchToFallback()
+		if convID == "" {
+			if resp.ConversationID != "" {
+				sess.SetConversationID(resp.ConversationID)
+				slog.Info("conversation ID received from agy stream", "conversationId", resp.ConversationID, "sessionId", sess.ID)
+			} else if !a.discoverAndSetConversationID(ctx, sess, previousID, startedAt) {
+				sess.SwitchToFallback()
+			}
 		}
 
 		return resp.Output, nil
