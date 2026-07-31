@@ -2,9 +2,12 @@ package agy
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -12,9 +15,8 @@ import (
 
 const repoLockRetryInterval = 25 * time.Millisecond
 
-// RepoCoordinator serializes AGY operations that share the global AGY cache.
-// AGY records conversations in one last_conversations.json file, so even
-// different repositories must coordinate unless AGY provides an invocation ID.
+// RepoCoordinator serializes AGY operations for the same working directory.
+// Different directories use distinct cache entries and can run concurrently.
 type RepoCoordinator struct {
 	lockDir string
 }
@@ -24,14 +26,20 @@ func NewRepoCoordinator(configDir string) *RepoCoordinator {
 }
 
 func (c *RepoCoordinator) Lock(ctx context.Context, cwd string) (func() error, error) {
-	if _, err := canonicalWorkdir(cwd); err != nil {
+	canonicalCwd, err := canonicalWorkdir(cwd)
+	if err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(c.lockDir, 0700); err != nil {
 		return nil, fmt.Errorf("create wrapper lock dir: %w", err)
 	}
 
-	path := filepath.Join(c.lockDir, "agy-global.lock")
+	// Hash the canonical path to keep lock names portable and avoid exposing it.
+	lockKey := canonicalCwd
+	if runtime.GOOS == "windows" {
+		lockKey = strings.ToLower(lockKey)
+	}
+	path := filepath.Join(c.lockDir, fmt.Sprintf("agy-workdir-%x.lock", sha256.Sum256([]byte(lockKey))))
 	lock := flock.New(path, flock.SetPermissions(0600))
 	locked, err := lock.TryLockContext(ctx, repoLockRetryInterval)
 	if err != nil {
