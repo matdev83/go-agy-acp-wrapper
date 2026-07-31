@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,7 +20,11 @@ func TestRepoCoordinator_SerializesAcrossProcesses(t *testing.T) {
 		if err != nil {
 			os.Exit(2)
 		}
-		defer unlock()
+		defer func() {
+			if err := unlock(); err != nil {
+				t.Errorf("unlock helper repository: %v", err)
+			}
+		}()
 		if err := os.WriteFile(os.Getenv("REPO_LOCK_READY"), []byte("ready"), 0600); err != nil {
 			os.Exit(3)
 		}
@@ -79,7 +85,11 @@ func TestRepoCoordinator_DifferentReposRunAcrossProcesses(t *testing.T) {
 		if err != nil {
 			os.Exit(2)
 		}
-		defer unlock()
+		defer func() {
+			if err := unlock(); err != nil {
+				t.Errorf("unlock helper repository: %v", err)
+			}
+		}()
 		if err := os.WriteFile(os.Getenv("REPO_LOCK_READY"), []byte("ready"), 0600); err != nil {
 			os.Exit(3)
 		}
@@ -136,12 +146,41 @@ func TestRepoCoordinator_SameRepoSerializesAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unlockFirst()
+	defer func() {
+		if err := unlockFirst(); err != nil {
+			t.Errorf("unlock first repository: %v", err)
+		}
+	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
-	defer cancel()
-	if unlockSecond, err := second.Lock(ctx, cwd); err == nil {
-		_ = unlockSecond()
-		t.Fatal("second wrapper instance unexpectedly acquired the same repository lock")
+	aliases := make(map[string]string)
+	symlink := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(cwd, symlink); err == nil {
+		aliases["symlink"] = symlink
+	}
+	if runtime.GOOS == "windows" {
+		caseVariant := strings.ToUpper(cwd)
+		if caseVariant == cwd {
+			caseVariant = strings.ToLower(cwd)
+		}
+		if caseVariant == cwd {
+			t.Fatal("could not construct a distinct case-variant repository path")
+		}
+		aliases["case variant"] = caseVariant
+	}
+	if len(aliases) == 0 {
+		t.Fatal("could not construct a distinct alias for repository path")
+	}
+
+	for name, alias := range aliases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+			defer cancel()
+			if unlockSecond, err := second.Lock(ctx, alias); err == nil {
+				if unlockErr := unlockSecond(); unlockErr != nil {
+					t.Errorf("unlock unexpectedly acquired repository: %v", unlockErr)
+				}
+				t.Fatal("second wrapper instance unexpectedly acquired an alias of the same repository")
+			}
+		})
 	}
 }
