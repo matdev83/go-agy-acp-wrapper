@@ -235,8 +235,24 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 			if response.Output == "" {
 				response.Output = detail
 			}
-			if termErr := stream.terminalError(response.ExitCode); IsTimeoutError(termErr) {
-				response.TimedOut = true
+			if termErr := stream.terminalError(response.ExitCode); termErr != nil {
+				if IsTimeoutError(termErr) {
+					response.TimedOut = true
+					return response, termErr
+				}
+				var procErr *ProcessError
+				if errors.As(termErr, &procErr) {
+					merged := strings.TrimSpace(procErr.Detail)
+					stderrDetail := strings.TrimSpace(detail)
+					if stderrDetail != "" && !strings.Contains(merged, stderrDetail) {
+						if merged == "" {
+							merged = stderrDetail
+						} else {
+							merged = merged + "\n" + stderrDetail
+						}
+					}
+					return response, &ProcessError{ExitCode: response.ExitCode, Detail: merged}
+				}
 				return response, termErr
 			}
 			return response, &ProcessError{ExitCode: response.ExitCode, Detail: detail}

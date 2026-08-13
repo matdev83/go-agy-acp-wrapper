@@ -327,6 +327,23 @@ func TestAgyJSONStream_WaitingResultIsTimeout(t *testing.T) {
 	}
 }
 
+func TestAgyJSONStream_FailedQuotaResultIsProviderLimit(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"init","conversation_id":"conv-quota"}`,
+		`{"event":"result","result":{"conversation_id":"conv-quota","status":"ERROR","response":"","error":"RESOURCE_EXHAUSTED: Gemini quota exceeded"}}`,
+	}, "\n")
+
+	var stream agyJSONStream
+	stream.read(strings.NewReader(input), nil)
+	err := stream.terminalError(1)
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if ShouldFallback(err) {
+		t.Fatal("quota terminal result should not fallback")
+	}
+}
+
 func TestAgyJSONStream_SuccessResultIsNotError(t *testing.T) {
 	input := `{"event":"result","result":{"conversation_id":"conv-ok","status":"SUCCESS","response":"done"}}`
 	var stream agyJSONStream
@@ -345,6 +362,39 @@ func TestShouldFallback_SkipsTimeoutAndQuota(t *testing.T) {
 	}
 	if !ShouldFallback(&ProcessError{ExitCode: 1, Detail: "conversation not found"}) {
 		t.Fatal("generic process error should fallback")
+	}
+}
+
+func TestNonInteractiveRunner_Execute_QuotaResultOnNonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	var script string
+	if runtime.GOOS == "windows" {
+		script = filepath.Join(dir, "quota-result.cmd")
+		body := "@echo off\r\n" +
+			"echo {\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"RESOURCE_EXHAUSTED: Gemini quota exceeded\",\"response\":\"\"}}\r\n" +
+			"echo command failed 1>&2\r\n" +
+			"exit /b 1\r\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	} else {
+		script = filepath.Join(dir, "quota-result.sh")
+		body := "#!/bin/sh\n" +
+			"printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"RESOURCE_EXHAUSTED: Gemini quota exceeded\",\"response\":\"\"}}'\n" +
+			"printf 'command failed\\n' >&2\n" +
+			"exit 1\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	}
+
+	r := NewNonInteractiveRunner(script, dir)
+	_, err := r.Execute(context.Background(), ExecuteOpts{Cwd: dir, Prompt: "hello"})
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if ShouldFallback(err) {
+		t.Fatal("quota result on non-zero exit should not fallback")
 	}
 }
 
