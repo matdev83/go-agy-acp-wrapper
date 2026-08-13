@@ -18,7 +18,7 @@ func TestNonInteractiveRunner_BuildArgs_SimplePrompt(t *testing.T) {
 	args := r.buildArgs(ExecuteOpts{
 		Prompt: "hello",
 	})
-	expected := []string{"--output-format", "stream-json", "--print", "hello"}
+	expected := []string{"--print-timeout", "24h0m0s", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -28,7 +28,7 @@ func TestNonInteractiveRunner_BuildArgs_WithConversation(t *testing.T) {
 		Prompt:         "hello",
 		ConversationID: "abc-123",
 	})
-	expected := []string{"--conversation", "abc-123", "--output-format", "stream-json", "--print", "hello"}
+	expected := []string{"--conversation", "abc-123", "--print-timeout", "24h0m0s", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -37,7 +37,7 @@ func TestNonInteractiveRunner_BuildArgs_WithPromptFile(t *testing.T) {
 	args := r.buildArgs(ExecuteOpts{
 		PromptFilePath: "/tmp/prompt.md",
 	})
-	expected := []string{"--output-format", "stream-json", "--print", "@/tmp/prompt.md"}
+	expected := []string{"--print-timeout", "24h0m0s", "--output-format", "stream-json", "--print", "@/tmp/prompt.md"}
 	assertArgs(t, expected, args)
 }
 
@@ -47,7 +47,7 @@ func TestNonInteractiveRunner_BuildArgs_WithSkipPerms(t *testing.T) {
 		Prompt:    "hello",
 		SkipPerms: true,
 	})
-	expected := []string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--print", "hello"}
+	expected := []string{"--dangerously-skip-permissions", "--print-timeout", "24h0m0s", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -57,7 +57,7 @@ func TestNonInteractiveRunner_BuildArgs_WithModel(t *testing.T) {
 		Prompt: "hello",
 		Model:  "gemini-2.5-pro",
 	})
-	expected := []string{"--model", "gemini-2.5-pro", "--output-format", "stream-json", "--print", "hello"}
+	expected := []string{"--model", "gemini-2.5-pro", "--print-timeout", "24h0m0s", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
 }
 
@@ -68,9 +68,34 @@ func TestNonInteractiveRunner_BuildArgs_AllOptions(t *testing.T) {
 		ConversationID: "conv-1",
 		Model:          "Gemini 3.1 Pro (High)",
 		SkipPerms:      true,
+		Timeout:        4 * time.Hour,
 	})
-	expected := []string{"--conversation", "conv-1", "--model", "Gemini 3.1 Pro (High)", "--dangerously-skip-permissions", "--output-format", "stream-json", "--print", "hello"}
+	expected := []string{"--conversation", "conv-1", "--model", "Gemini 3.1 Pro (High)", "--dangerously-skip-permissions", "--print-timeout", "4h0m0s", "--output-format", "stream-json", "--print", "hello"}
 	assertArgs(t, expected, args)
+}
+
+func TestFormatPrintTimeout(t *testing.T) {
+	if got := formatPrintTimeout(0); got != "24h0m0s" {
+		t.Fatalf("zero timeout = %q", got)
+	}
+	if got := formatPrintTimeout(4 * time.Hour); got != "4h0m0s" {
+		t.Fatalf("four hour timeout = %q", got)
+	}
+	if got := formatPrintTimeout(45 * time.Second); got != "45s" {
+		t.Fatalf("seconds timeout = %q", got)
+	}
+}
+
+func TestProcessKillTimeoutAddsGrace(t *testing.T) {
+	if got := processKillTimeout(0); got != 0 {
+		t.Fatalf("zero timeout should disable process kill, got %s", got)
+	}
+	if got := processKillTimeout(200 * time.Millisecond); got != 200*time.Millisecond {
+		t.Fatalf("short timeout should not add grace, got %s", got)
+	}
+	if got := processKillTimeout(4 * time.Hour); got != 4*time.Hour+printTimeoutKillGrace {
+		t.Fatalf("kill timeout = %s", got)
+	}
 }
 
 func TestNonInteractiveRunner_Execute_BinaryNotFound(t *testing.T) {
@@ -282,6 +307,118 @@ func TestAgyJSONStream_EmitsToolProgressWithoutTextDelta(t *testing.T) {
 	}
 	if events[1].Kind != StreamEventToolUpdate || events[1].ToolState != "DONE" || events[1].RawOutput != "clean" {
 		t.Fatalf("unexpected tool completion: %#v", events[1])
+	}
+}
+
+func TestAgyJSONStream_WaitingResultIsTimeout(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"init","conversation_id":"conv-wait"}`,
+		`{"event":"result","result":{"conversation_id":"conv-wait","status":"WAITING","response":"","error":"print timeout while waiting for background work"}}`,
+	}, "\n")
+
+	var stream agyJSONStream
+	stream.read(strings.NewReader(input), nil)
+	err := stream.terminalError(0)
+	if !IsTimeoutError(err) {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "WAITING") {
+		t.Fatalf("expected WAITING in error, got %v", err)
+	}
+}
+
+func TestAgyJSONStream_FailedQuotaResultIsProviderLimit(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"init","conversation_id":"conv-quota"}`,
+		`{"event":"result","result":{"conversation_id":"conv-quota","status":"ERROR","response":"","error":"RESOURCE_EXHAUSTED: Gemini quota exceeded"}}`,
+	}, "\n")
+
+	var stream agyJSONStream
+	stream.read(strings.NewReader(input), nil)
+	err := stream.terminalError(1)
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if ShouldFallback(err) {
+		t.Fatal("quota terminal result should not fallback")
+	}
+}
+
+func TestAgyJSONStream_SuccessResultIsNotError(t *testing.T) {
+	input := `{"event":"result","result":{"conversation_id":"conv-ok","status":"SUCCESS","response":"done"}}`
+	var stream agyJSONStream
+	stream.read(strings.NewReader(input), nil)
+	if err := stream.terminalError(0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestShouldFallback_SkipsTimeoutAndQuota(t *testing.T) {
+	if ShouldFallback(&TimeoutError{Timeout: time.Minute}) {
+		t.Fatal("timeout should not fallback")
+	}
+	if ShouldFallback(&ProcessError{ExitCode: 1, Detail: "quota exceeded"}) {
+		t.Fatal("quota should not fallback")
+	}
+	if !ShouldFallback(&ProcessError{ExitCode: 1, Detail: "conversation not found"}) {
+		t.Fatal("generic process error should fallback")
+	}
+}
+
+func TestNonInteractiveRunner_Execute_QuotaResultOnNonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	var script string
+	if runtime.GOOS == "windows" {
+		script = filepath.Join(dir, "quota-result.cmd")
+		body := "@echo off\r\n" +
+			"echo {\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"RESOURCE_EXHAUSTED: Gemini quota exceeded\",\"response\":\"\"}}\r\n" +
+			"echo command failed 1>&2\r\n" +
+			"exit /b 1\r\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	} else {
+		script = filepath.Join(dir, "quota-result.sh")
+		body := "#!/bin/sh\n" +
+			"printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"RESOURCE_EXHAUSTED: Gemini quota exceeded\",\"response\":\"\"}}'\n" +
+			"printf 'command failed\\n' >&2\n" +
+			"exit 1\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	}
+
+	r := NewNonInteractiveRunner(script, dir)
+	_, err := r.Execute(context.Background(), ExecuteOpts{Cwd: dir, Prompt: "hello"})
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if ShouldFallback(err) {
+		t.Fatal("quota result on non-zero exit should not fallback")
+	}
+}
+
+func TestNonInteractiveRunner_Execute_TimeoutReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based timeout test is Unix-only")
+	}
+
+	script := filepath.Join(t.TempDir(), "sleep.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 5\n"), 0700); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	r := NewNonInteractiveRunner(script, t.TempDir())
+	resp, err := r.Execute(context.Background(), ExecuteOpts{
+		Cwd:     t.TempDir(),
+		Prompt:  "hello",
+		Timeout: 200 * time.Millisecond,
+	})
+	if !IsTimeoutError(err) {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if resp == nil || !resp.TimedOut {
+		t.Fatalf("expected timed-out response, got %#v", resp)
 	}
 }
 

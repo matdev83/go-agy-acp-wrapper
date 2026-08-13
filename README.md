@@ -102,7 +102,7 @@ flags instead of environment variables:
 go-agy-acp-wrapper \
   --agy-binary agy \
   --model gemini-2.5-flash \
-  --timeout-seconds 300 \
+  --timeout-seconds 14400 \
   --prompt-threshold 8000
 ```
 
@@ -115,7 +115,7 @@ Use `go-agy-acp-wrapper --version` for executable validation without starting AC
 | `AGY_BINARY` | `agy.exe` (Windows) / `agy` (Linux) | Path to the agy binary |
 | `AGY_MODEL` | _(empty = catalog default)_ | Default model for new sessions (e.g. `gemini-3.6-flash-high`) |
 | `AGY_PROMPT_THRESHOLD` | `8000` | Byte threshold above which prompts are written to temp files |
-| `AGY_TIMEOUT_SECONDS` | `300` | Per-turn execution timeout in seconds |
+| `AGY_TIMEOUT_SECONDS` | `14400` (4 hours) | Per-turn execution timeout in seconds. Forwarded to agy as `--print-timeout` (agy's own print-mode default is 5 minutes). |
 | `AGY_SKIP_PERMISSIONS` | `true` | Whether to pass `--dangerously-skip-permissions` to `agy`; set to `false` to opt out |
 
 Equivalent CLI flags are available and override environment values:
@@ -125,7 +125,7 @@ Equivalent CLI flags are available and override environment values:
 | `--agy-binary <path>` | Path to the agy binary |
 | `--model <model>` | Default model for new sessions |
 | `--prompt-threshold <bytes>` | Byte threshold above which prompts are written to workdir files |
-| `--timeout-seconds <seconds>` | Per-turn execution timeout |
+| `--timeout-seconds <seconds>` | Per-turn execution timeout and agy `--print-timeout` |
 | `--skip-permissions` | Force-enable `--dangerously-skip-permissions` |
 | `--no-skip-permissions` | Opt out of `--dangerously-skip-permissions` |
 | `--version` | Print wrapper version and exit |
@@ -244,6 +244,9 @@ internal/
 - The wrapper uses `--dangerously-skip-permissions` by default to avoid interactive
   permission prompts. This bypasses agy's safety checks; opt out with
   `AGY_SKIP_PERMISSIONS=false` or `--no-skip-permissions`.
+- Clients that spawn the wrapper with `--timeout-seconds` (including LIP
+  `process_timeout`) override the 4-hour default. Keep that value high enough for
+  long tool waits; agy's own `--print-timeout` default is 5 minutes.
 
 ## Platform Notes
 

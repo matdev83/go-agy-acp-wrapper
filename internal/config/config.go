@@ -12,8 +12,11 @@ import (
 
 const (
 	DefaultPromptThreshold = 8000
-	DefaultTimeoutSeconds  = 300
-	DefaultSessionIDLen    = 8
+	// DefaultTimeoutSeconds is the per-turn ceiling for both the wrapper's
+	// process watchdog and agy's own --print-timeout. agy's print-mode default
+	// is 5m; keep this far above long tool waits such as test suites.
+	DefaultTimeoutSeconds = 4 * 60 * 60
+	DefaultSessionIDLen   = 8
 )
 
 type Config struct {
@@ -82,7 +85,7 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	fs.StringVar(&opts.AgyBinary, "agy-binary", "", "agy executable path")
 	fs.StringVar(&opts.Model, "model", "", "default agy model")
 	fs.IntVar(&opts.PromptThreshold, "prompt-threshold", 0, "prompt file threshold")
-	fs.IntVar(&opts.TimeoutSeconds, "timeout-seconds", 0, "agy execution timeout")
+	fs.IntVar(&opts.TimeoutSeconds, "timeout-seconds", 0, "agy execution and --print-timeout (seconds)")
 	fs.BoolVar(&skipPerms, "skip-permissions", false, "pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&noSkipPerms, "no-skip-permissions", false, "do not pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&version, "version", false, "print version and exit")

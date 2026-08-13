@@ -247,15 +247,16 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		}
 
 		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
+		out, err := turnOutput(resp, err, opts)
 		if err != nil {
-			if agy.IsProviderLimitError(err) {
+			if !agy.ShouldFallback(err) {
 				return "", err
 			}
 			slog.Warn("native conversation failed, switching to fallback", "error", err, "sessionId", sess.ID)
 			sess.SwitchToFallback()
 			return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 		}
-		return resp.Output, nil
+		return out, nil
 
 	default:
 		previousID, err := a.discoverer.SnapshotConversationID(ctx, sess.Cwd)
@@ -276,6 +277,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		}
 
 		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
+		out, err := turnOutput(resp, err, opts)
 		if err != nil {
 			return "", err
 		}
@@ -289,7 +291,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 			}
 		}
 
-		return resp.Output, nil
+		return out, nil
 	}
 }
 
@@ -310,8 +312,18 @@ func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Contex
 	opts.PromptFilePath = contextPath
 
 	resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
+	return turnOutput(resp, err, opts)
+}
+
+func turnOutput(resp *agy.Response, err error, opts agy.ExecuteOpts) (string, error) {
 	if err != nil {
 		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("agy returned an empty response")
+	}
+	if resp.TimedOut {
+		return "", &agy.TimeoutError{Timeout: opts.Timeout, Detail: resp.Output}
 	}
 	return resp.Output, nil
 }
@@ -713,7 +725,10 @@ func Serve(ctx context.Context, cfg *config.Config, input io.Reader, output io.W
 	}
 }
 
-const providerLimitErrorCode = -32003
+const (
+	providerLimitErrorCode = -32003
+	timeoutErrorCode       = -32004
+)
 
 func promptRequestError(err error) error {
 	message := "Agy request failed"
@@ -721,6 +736,9 @@ func promptRequestError(err error) error {
 	if agy.IsProviderLimitError(err) {
 		message = "Model provider quota or rate limit exceeded"
 		code = providerLimitErrorCode
+	} else if agy.IsTimeoutError(err) {
+		message = "Agy request timed out"
+		code = timeoutErrorCode
 	}
 	return &acp.RequestError{
 		Code:    code,
