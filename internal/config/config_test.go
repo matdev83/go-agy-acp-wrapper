@@ -2,6 +2,21 @@ package config
 
 import "testing"
 
+func TestLoad_DefaultTimeoutIsFourHours(t *testing.T) {
+	t.Setenv("AGY_TIMEOUT_SECONDS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.TimeoutSeconds != DefaultTimeoutSeconds {
+		t.Fatalf("expected default timeout %d, got %d", DefaultTimeoutSeconds, cfg.TimeoutSeconds)
+	}
+	if DefaultTimeoutSeconds != 4*60*60 {
+		t.Fatalf("expected four-hour default, got %d", DefaultTimeoutSeconds)
+	}
+}
+
 func TestLoad_SkipPermsDefault(t *testing.T) {
 	t.Setenv("AGY_SKIP_PERMISSIONS", "")
 

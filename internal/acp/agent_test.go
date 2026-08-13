@@ -386,6 +386,42 @@ func TestAgyAgent_Prompt_ReturnsDescriptiveQuotaRequestError(t *testing.T) {
 	}
 }
 
+func TestAgyAgent_Prompt_TimeoutDoesNotFallback(t *testing.T) {
+	agent := newTestAgent(t)
+	runner := &errorRunner{err: &agy.TimeoutError{Timeout: 4 * time.Hour, Detail: "print timeout"}}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	sess, ok := agent.store.Get(string(sessResp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	sess.SetConversationID("conv-123")
+	sess.AddUserMessage("previous")
+	sess.AddAssistantMessage("answer")
+
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("next")},
+	})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("expected ACP request error, got %T: %v", err, err)
+	}
+	if requestErr.Code != timeoutErrorCode || requestErr.Message != "Agy request timed out" {
+		t.Fatalf("unexpected request error: %#v", requestErr)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("timeout should not be retried in fallback mode; got %d calls", runner.calls)
+	}
+	if sess.GetMode() != session.ModeNativeConversation {
+		t.Fatal("timeout unexpectedly switched session to fallback mode")
+	}
+}
+
 type blockingRunner struct {
 	started   chan struct{}
 	cancelled chan struct{}

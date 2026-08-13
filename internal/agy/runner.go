@@ -90,6 +90,48 @@ func IsProviderLimitError(err error) bool {
 	return false
 }
 
+// TimeoutError is returned when agy hits the wrapper watchdog or print-timeout
+// while still waiting (for example on a long-running tool).
+type TimeoutError struct {
+	Timeout time.Duration
+	Detail  string
+}
+
+func (e *TimeoutError) Error() string {
+	detail := strings.TrimSpace(e.Detail)
+	if e.Timeout > 0 {
+		if detail == "" {
+			return fmt.Sprintf("agy execution timed out after %s", e.Timeout)
+		}
+		return fmt.Sprintf("agy execution timed out after %s: %s", e.Timeout, detail)
+	}
+	if detail == "" {
+		return "agy print run timed out while waiting"
+	}
+	return fmt.Sprintf("agy print run timed out while waiting: %s", detail)
+}
+
+func IsTimeoutError(err error) bool {
+	var timeoutErr *TimeoutError
+	return errors.As(err, &timeoutErr)
+}
+
+// ShouldFallback reports whether a failed native --conversation turn should be
+// retried with a dumped virtual context. Timeouts and provider limits must not
+// be retried: a retry would start another long wait or burn quota.
+func ShouldFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !IsProviderLimitError(err) && !IsTimeoutError(err)
+}
+
+const (
+	unboundedPrintTimeout  = 24 * time.Hour
+	printTimeoutKillGrace  = 30 * time.Second
+	transcriptPollInterval = 50 * time.Millisecond
+)
+
 type Runner interface {
 	Execute(ctx context.Context, opts ExecuteOpts) (*Response, error)
 	ExecuteStream(ctx context.Context, opts ExecuteOpts, onEvent func(StreamEvent)) (*Response, error)
@@ -99,8 +141,6 @@ type NonInteractiveRunner struct {
 	binary    string
 	configDir string
 }
-
-const transcriptPollInterval = 50 * time.Millisecond
 
 func NewNonInteractiveRunner(binary, configDir string) *NonInteractiveRunner {
 	return &NonInteractiveRunner{binary: binary, configDir: configDir}
@@ -116,8 +156,8 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 
 	var execCtx context.Context
 	var cancel context.CancelFunc
-	if opts.Timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+	if killAfter := processKillTimeout(opts.Timeout); killAfter > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, killAfter)
 	} else {
 		execCtx, cancel = context.WithCancel(ctx)
 	}
@@ -174,7 +214,10 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 		if execCtx.Err() == context.DeadlineExceeded {
 			response.TimedOut = true
 			response.ExitCode = -1
-			return response, nil
+			return response, &TimeoutError{
+				Timeout: printTimeoutDuration(opts.Timeout),
+				Detail:  strings.TrimSpace(response.Output),
+			}
 		}
 		if ctx.Err() == context.Canceled {
 			response.ExitCode = -1
@@ -192,12 +235,22 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 			if response.Output == "" {
 				response.Output = detail
 			}
+			if termErr := stream.terminalError(response.ExitCode); IsTimeoutError(termErr) {
+				response.TimedOut = true
+				return response, termErr
+			}
 			return response, &ProcessError{ExitCode: response.ExitCode, Detail: detail}
 		}
 		return nil, fmt.Errorf("failed to execute agy: %w", err)
 	}
 
 	response.ExitCode = 0
+	if termErr := stream.terminalError(response.ExitCode); termErr != nil {
+		if IsTimeoutError(termErr) {
+			response.TimedOut = true
+		}
+		return response, termErr
+	}
 
 	if response.Output == "" && opts.ConversationID != "" {
 		if extracted := r.extractFromTranscript(opts.ConversationID); len(extracted) > len(response.Output) {
@@ -213,6 +266,8 @@ type agyJSONStream struct {
 	raw            bytes.Buffer
 	streamed       strings.Builder
 	result         string
+	resultStatus   string
+	resultError    string
 	conversationID string
 }
 
@@ -242,7 +297,9 @@ func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
 			} `json:"step_update"`
 			Result struct {
 				ConversationID string `json:"conversation_id"`
+				Status         string `json:"status"`
 				Response       string `json:"response"`
+				Error          string `json:"error"`
 			} `json:"result"`
 		}
 		if json.Unmarshal(line, &event) != nil {
@@ -285,6 +342,8 @@ func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
 			if event.Result.ConversationID != "" {
 				s.conversationID = event.Result.ConversationID
 			}
+			s.resultStatus = event.Result.Status
+			s.resultError = normalizeLineEndings(event.Result.Error)
 			s.result = normalizeLineEndings(event.Result.Response)
 		}
 	}
@@ -298,6 +357,31 @@ func (s *agyJSONStream) output() string {
 		return s.streamed.String()
 	}
 	return normalizeLineEndings(s.raw.String())
+}
+
+func (s *agyJSONStream) terminalError(exitCode int) error {
+	status := strings.ToUpper(strings.TrimSpace(s.resultStatus))
+	if status == "" || status == "SUCCESS" {
+		return nil
+	}
+	detail := strings.TrimSpace(s.resultError)
+	if detail == "" {
+		detail = strings.TrimSpace(s.output())
+	}
+	if status == "WAITING" || status == "RUNNING" {
+		if detail == "" {
+			detail = fmt.Sprintf("agy ended with status %s", status)
+		} else {
+			detail = fmt.Sprintf("agy ended with status %s: %s", status, detail)
+		}
+		return &TimeoutError{Detail: detail}
+	}
+	if detail == "" {
+		detail = fmt.Sprintf("agy print run ended with status %s", status)
+	} else {
+		detail = fmt.Sprintf("agy print run ended with status %s: %s", status, detail)
+	}
+	return &ProcessError{ExitCode: exitCode, Detail: detail}
 }
 
 func streamPipeLines(r io.Reader, dst *bytes.Buffer, onChunk func(string)) {
@@ -557,6 +641,7 @@ func (r *NonInteractiveRunner) buildArgs(opts ExecuteOpts) []string {
 		args = append(args, "--dangerously-skip-permissions")
 	}
 
+	args = append(args, "--print-timeout", formatPrintTimeout(opts.Timeout))
 	args = append(args, "--output-format", "stream-json", "--print")
 	if opts.PromptFilePath != "" {
 		args = append(args, "@"+opts.PromptFilePath)
@@ -624,4 +709,25 @@ func readJSONLLine(r io.ByteReader) ([]byte, error) {
 
 func normalizeLineEndings(s string) string {
 	return strings.ReplaceAll(s, "\r\n", "\n")
+}
+
+func printTimeoutDuration(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return unboundedPrintTimeout
+}
+
+func formatPrintTimeout(timeout time.Duration) string {
+	return printTimeoutDuration(timeout).String()
+}
+
+func processKillTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 0
+	}
+	if timeout <= printTimeoutKillGrace {
+		return timeout
+	}
+	return timeout + printTimeoutKillGrace
 }
