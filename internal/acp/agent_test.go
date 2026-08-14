@@ -965,6 +965,9 @@ func TestStreamEventUpdate_MapsToolLifecycle(t *testing.T) {
 	if start.ToolCall.ToolCallId != "agy-step-3" || start.ToolCall.Status != acp.ToolCallStatusInProgress {
 		t.Fatalf("unexpected tool call start: %#v", start.ToolCall)
 	}
+	if start.ToolCall.Title != "run_command: git status" {
+		t.Fatalf("expected command line in tool title, got %q", start.ToolCall.Title)
+	}
 
 	done, ok := streamEventUpdate(agy.StreamEvent{
 		Kind:      agy.StreamEventToolUpdate,
@@ -979,6 +982,26 @@ func TestStreamEventUpdate_MapsToolLifecycle(t *testing.T) {
 		done.ToolCallUpdate.Status == nil ||
 		*done.ToolCallUpdate.Status != acp.ToolCallStatusCompleted {
 		t.Fatalf("unexpected tool call completion: %#v", done.ToolCallUpdate)
+	}
+
+	active, ok := streamEventUpdate(agy.StreamEvent{
+		Kind:      agy.StreamEventToolUpdate,
+		ToolID:    "agy-step-3",
+		ToolState: "ACTIVE",
+	})
+	if !ok || active.ToolCallUpdate == nil || active.ToolCallUpdate.Status == nil ||
+		*active.ToolCallUpdate.Status != acp.ToolCallStatusInProgress {
+		t.Fatalf("expected in-progress for ACTIVE update, got %#v", active.ToolCallUpdate)
+	}
+
+	failed, ok := streamEventUpdate(agy.StreamEvent{
+		Kind:      agy.StreamEventToolUpdate,
+		ToolID:    "agy-step-3",
+		ToolState: "ERROR",
+	})
+	if !ok || failed.ToolCallUpdate == nil || failed.ToolCallUpdate.Status == nil ||
+		*failed.ToolCallUpdate.Status != acp.ToolCallStatusFailed {
+		t.Fatalf("expected failed for ERROR update, got %#v", failed.ToolCallUpdate)
 	}
 }
 

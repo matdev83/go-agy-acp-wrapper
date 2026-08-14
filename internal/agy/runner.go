@@ -72,22 +72,62 @@ func (e *ProcessError) Error() string {
 	return fmt.Sprintf("agy request failed (exit code %d): %s", e.ExitCode, detail)
 }
 
+var providerLimitMarkers = []string{
+	"quota", "resource_exhausted", "resource exhausted", "rate limit",
+	"too many requests", "usage limit", "limit reached", "status 429", "code 429",
+	"weighted tokens", "tokens remaining", "tokens left", "out of tokens",
+}
+
+func looksLikeProviderLimit(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range providerLimitMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredProviderLimitDetail(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var best string
+	bestHasExact := false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !looksLikeProviderLimit(line) {
+			continue
+		}
+		lower := strings.ToLower(line)
+		exact := strings.Contains(lower, "resource_exhausted") ||
+			strings.Contains(lower, "individual quota") ||
+			strings.Contains(lower, "code 429")
+		if best == "" || (exact && !bestHasExact) || (exact == bestHasExact && len(line) > len(best)) {
+			best = line
+			bestHasExact = exact
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return text
+}
+
+func extractProviderLimitDetail(text string) (string, bool) {
+	if !looksLikeProviderLimit(text) {
+		return "", false
+	}
+	return preferredProviderLimitDetail(text), true
+}
+
 func IsProviderLimitError(err error) bool {
 	var processErr *ProcessError
 	if !errors.As(err, &processErr) {
 		return false
 	}
-	message := strings.ToLower(processErr.Detail)
-	for _, marker := range []string{
-		"quota", "resource_exhausted", "resource exhausted", "rate limit",
-		"too many requests", "usage limit", "limit reached", "status 429", "code 429",
-		"weighted tokens", "tokens remaining", "tokens left", "out of tokens",
-	} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
+	return looksLikeProviderLimit(processErr.Detail)
 }
 
 // TimeoutError is returned when agy hits the wrapper watchdog or print-timeout
@@ -191,15 +231,24 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	}
 	var stream agyJSONStream
 	var stderr bytes.Buffer
+	var limitOnce sync.Once
+	triggerLimit := func(detail string) {
+		stream.noteProviderLimit(detail)
+		limitOnce.Do(cancel)
+	}
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() {
 		defer readers.Done()
-		stream.read(stdoutPipe, onEvent)
+		stream.read(stdoutPipe, onEvent, triggerLimit)
 	}()
 	go func() {
 		defer readers.Done()
-		_, _ = io.Copy(&stderr, stderrPipe)
+		streamPipeLines(stderrPipe, &stderr, func(_ string) {
+			if detail, ok := extractProviderLimitDetail(stderr.String()); ok {
+				triggerLimit(detail)
+			}
+		})
 	}()
 
 	err = cmd.Wait()
@@ -208,6 +257,21 @@ func (r *NonInteractiveRunner) ExecuteStream(ctx context.Context, opts ExecuteOp
 	response := &Response{
 		Output:         stream.output(),
 		ConversationID: stream.conversationID,
+	}
+	if quota := stream.providerLimitDetail(); quota != "" {
+		exitCode := -1
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			}
+		} else {
+			exitCode = 0
+		}
+		response.ExitCode = exitCode
+		if strings.TrimSpace(response.Output) == "" {
+			response.Output = quota
+		}
+		return response, &ProcessError{ExitCode: exitCode, Detail: quota}
 	}
 
 	if err != nil {
@@ -285,9 +349,45 @@ type agyJSONStream struct {
 	resultStatus   string
 	resultError    string
 	conversationID string
+	mu             sync.Mutex
+	quotaDetail    string
 }
 
-func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
+func (s *agyJSONStream) noteProviderLimit(detail string) {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.quotaDetail == "" {
+		s.quotaDetail = detail
+		return
+	}
+	preferred, _ := extractProviderLimitDetail(s.quotaDetail + "\n" + detail)
+	if preferred != "" {
+		s.quotaDetail = preferred
+	}
+}
+
+func (s *agyJSONStream) providerLimitDetail() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaDetail
+}
+
+func (s *agyJSONStream) observeLimitText(text string, onLimit func(string)) {
+	detail, ok := extractProviderLimitDetail(text)
+	if !ok {
+		return
+	}
+	s.noteProviderLimit(detail)
+	if onLimit != nil {
+		onLimit(detail)
+	}
+}
+
+func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent), onLimit func(string)) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
@@ -319,6 +419,7 @@ func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
 			} `json:"result"`
 		}
 		if json.Unmarshal(line, &event) != nil {
+			s.observeLimitText(string(line), onLimit)
 			continue
 		}
 		switch event.Event {
@@ -361,6 +462,10 @@ func (s *agyJSONStream) read(r io.Reader, onEvent func(StreamEvent)) {
 			s.resultStatus = event.Result.Status
 			s.resultError = normalizeLineEndings(event.Result.Error)
 			s.result = normalizeLineEndings(event.Result.Response)
+		}
+		s.observeLimitText(string(line), onLimit)
+		if event.Result.Error != "" {
+			s.observeLimitText(event.Result.Error, onLimit)
 		}
 	}
 }
