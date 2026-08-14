@@ -158,7 +158,8 @@ func IsTimeoutError(err error) bool {
 
 // ShouldFallback reports whether a failed native --conversation turn should be
 // retried with a dumped virtual context. Timeouts and provider limits must not
-// be retried: a retry would start another long wait or burn quota.
+// dump context: timeouts would start another long wait, and quota retries are
+// handled as wait-and-continue on the native conversation instead.
 func ShouldFallback(err error) bool {
 	if err == nil {
 		return false

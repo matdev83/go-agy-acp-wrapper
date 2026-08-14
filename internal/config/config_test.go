@@ -58,6 +58,9 @@ func TestParseCLIOptions(t *testing.T) {
 	if opts.AgyBinary != "custom-agy" || opts.Model != "gemini-test" || opts.PromptThreshold != 123 || opts.TimeoutSeconds != 45 {
 		t.Fatalf("unexpected parsed options: %+v", opts)
 	}
+	if opts.QuotaRetryAttempts != 0 || opts.QuotaRetryMaxWaitSeconds != 0 {
+		t.Fatalf("expected quota retry flags to stay unset, got %+v", opts)
+	}
 	if opts.SkipPerms == nil || *opts.SkipPerms {
 		t.Fatalf("expected skip perms opt-out, got %+v", opts.SkipPerms)
 	}
@@ -169,3 +172,36 @@ func TestLoadWithOptions_ExecutionEnvNoteOverridesEnv(t *testing.T) {
 		t.Fatal("expected CLI override to re-enable env-note injection")
 	}
 }
+
+func TestLoad_QuotaRetryDefaults(t *testing.T) {
+	t.Setenv("AGY_QUOTA_RETRY_ATTEMPTS", "")
+	t.Setenv("AGY_QUOTA_RETRY_MAX_WAIT_SECONDS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.QuotaRetryAttempts != DefaultQuotaRetryAttempts {
+		t.Fatalf("attempts = %d, want %d", cfg.QuotaRetryAttempts, DefaultQuotaRetryAttempts)
+	}
+	if cfg.QuotaRetryMaxWaitSeconds != 0 {
+		t.Fatalf("max wait = %d, want 0 (remaining timeout)", cfg.QuotaRetryMaxWaitSeconds)
+	}
+}
+
+func TestParseCLIOptions_QuotaRetry(t *testing.T) {
+	opts, showVersion, err := ParseCLIOptions([]string{
+		"--quota-retry-attempts", "3",
+		"--quota-retry-max-wait-seconds", "900",
+	})
+	if err != nil {
+		t.Fatalf("ParseCLIOptions failed: %v", err)
+	}
+	if showVersion {
+		t.Fatal("did not expect version mode")
+	}
+	if opts.QuotaRetryAttempts != 3 || opts.QuotaRetryMaxWaitSeconds != 900 {
+		t.Fatalf("unexpected quota retry options: %+v", opts)
+	}
+}
+

@@ -17,26 +17,33 @@ const (
 	// is 5m; keep this far above long tool waits such as test suites.
 	DefaultTimeoutSeconds = 4 * 60 * 60
 	DefaultSessionIDLen   = 8
+	// DefaultQuotaRetryAttempts is the number of agy invocations per ACP prompt
+	// when the model provider returns a 429 / quota error (1 initial + retries).
+	DefaultQuotaRetryAttempts = 5
 )
 
 type Config struct {
-	AgyBinary              string
-	HomeDir                string
-	PromptThreshold        int
-	TimeoutSeconds         int
-	DefaultModel           string
-	SkipPerms              bool
-	InjectExecutionEnvNote bool
+	AgyBinary                string
+	HomeDir                  string
+	PromptThreshold          int
+	TimeoutSeconds           int
+	QuotaRetryAttempts       int
+	QuotaRetryMaxWaitSeconds int
+	DefaultModel             string
+	SkipPerms                bool
+	InjectExecutionEnvNote   bool
 }
 
 type CLIOptions struct {
-	AgyBinary              string
-	Model                  string
-	PromptThreshold        int
-	TimeoutSeconds         int
-	SkipPerms              *bool
-	InjectExecutionEnvNote *bool
-	ListModels             bool
+	AgyBinary                string
+	Model                    string
+	PromptThreshold          int
+	TimeoutSeconds           int
+	QuotaRetryAttempts       int
+	QuotaRetryMaxWaitSeconds int
+	SkipPerms                *bool
+	InjectExecutionEnvNote   *bool
+	ListModels               bool
 }
 
 func Load() (*Config, error) {
@@ -50,13 +57,15 @@ func LoadWithOptions(opts CLIOptions) (*Config, error) {
 	}
 
 	cfg := &Config{
-		AgyBinary:              getEnvOrDefault("AGY_BINARY", detectAgyBinary()),
-		HomeDir:                home,
-		PromptThreshold:        getEnvIntOrDefault("AGY_PROMPT_THRESHOLD", DefaultPromptThreshold),
-		TimeoutSeconds:         getEnvIntOrDefault("AGY_TIMEOUT_SECONDS", DefaultTimeoutSeconds),
-		DefaultModel:           os.Getenv("AGY_MODEL"),
-		SkipPerms:              getEnvBoolOrDefault("AGY_SKIP_PERMISSIONS", true),
-		InjectExecutionEnvNote: !getEnvBoolOrDefault("AGY_ACP_SKIP_ENV_NOTE", false),
+		AgyBinary:                getEnvOrDefault("AGY_BINARY", detectAgyBinary()),
+		HomeDir:                  home,
+		PromptThreshold:          getEnvIntOrDefault("AGY_PROMPT_THRESHOLD", DefaultPromptThreshold),
+		TimeoutSeconds:           getEnvIntOrDefault("AGY_TIMEOUT_SECONDS", DefaultTimeoutSeconds),
+		QuotaRetryAttempts:       getEnvIntOrDefault("AGY_QUOTA_RETRY_ATTEMPTS", DefaultQuotaRetryAttempts),
+		QuotaRetryMaxWaitSeconds: getEnvIntOrDefault("AGY_QUOTA_RETRY_MAX_WAIT_SECONDS", 0),
+		DefaultModel:             os.Getenv("AGY_MODEL"),
+		SkipPerms:                getEnvBoolOrDefault("AGY_SKIP_PERMISSIONS", true),
+		InjectExecutionEnvNote:   !getEnvBoolOrDefault("AGY_ACP_SKIP_ENV_NOTE", false),
 	}
 	if opts.AgyBinary != "" {
 		cfg.AgyBinary = opts.AgyBinary
@@ -69,6 +78,12 @@ func LoadWithOptions(opts CLIOptions) (*Config, error) {
 	}
 	if opts.TimeoutSeconds > 0 {
 		cfg.TimeoutSeconds = opts.TimeoutSeconds
+	}
+	if opts.QuotaRetryAttempts > 0 {
+		cfg.QuotaRetryAttempts = opts.QuotaRetryAttempts
+	}
+	if opts.QuotaRetryMaxWaitSeconds > 0 {
+		cfg.QuotaRetryMaxWaitSeconds = opts.QuotaRetryMaxWaitSeconds
 	}
 	if opts.SkipPerms != nil {
 		cfg.SkipPerms = *opts.SkipPerms
@@ -94,6 +109,8 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	fs.StringVar(&opts.Model, "model", "", "default agy model")
 	fs.IntVar(&opts.PromptThreshold, "prompt-threshold", 0, "prompt file threshold")
 	fs.IntVar(&opts.TimeoutSeconds, "timeout-seconds", 0, "agy execution and --print-timeout (seconds)")
+	fs.IntVar(&opts.QuotaRetryAttempts, "quota-retry-attempts", 0, "agy invocations per prompt after 429/quota errors")
+	fs.IntVar(&opts.QuotaRetryMaxWaitSeconds, "quota-retry-max-wait-seconds", 0, "cap for a single 429 backoff (0 = remaining turn timeout)")
 	fs.BoolVar(&skipPerms, "skip-permissions", false, "pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&noSkipPerms, "no-skip-permissions", false, "do not pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&envNote, "execution-env-note", false, "prepend the execution-environment steering note (default)")

@@ -42,6 +42,9 @@ func newTestAgent(t *testing.T) *AgyAgent {
 		"claude-sonnet-4-6",
 		"claude-opus-4-6-thinking",
 	)
+	agent.sleep = func(ctx context.Context, d time.Duration) error {
+		return ctx.Err()
+	}
 	t.Cleanup(agent.Close)
 	return agent
 }
@@ -345,6 +348,32 @@ func (r *errorRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, o
 	return nil, r.err
 }
 
+type scriptedCall struct {
+	resp *agy.Response
+	err  error
+}
+
+type scriptedRunner struct {
+	mu     sync.Mutex
+	calls  []agy.ExecuteOpts
+	script []scriptedCall
+}
+
+func (r *scriptedRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return r.ExecuteStream(ctx, opts, nil)
+}
+
+func (r *scriptedRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := len(r.calls)
+	r.calls = append(r.calls, opts)
+	if idx >= len(r.script) {
+		return nil, fmt.Errorf("unexpected extra ExecuteStream call %d", idx)
+	}
+	return r.script[idx].resp, r.script[idx].err
+}
+
 type recordingRunner struct {
 	mu    sync.Mutex
 	calls []agy.ExecuteOpts
@@ -512,11 +541,125 @@ func TestAgyAgent_Prompt_ReturnsDescriptiveQuotaRequestError(t *testing.T) {
 	if !strings.Contains(fmt.Sprint(requestErr.Data), "Gemini quota exceeded") {
 		t.Fatalf("expected provider detail in request error data: %#v", requestErr.Data)
 	}
-	if runner.calls != 1 {
-		t.Fatalf("quota failure should not be retried in fallback mode; got %d calls", runner.calls)
+	if runner.calls != config.DefaultQuotaRetryAttempts {
+		t.Fatalf("quota failure should retry native conversation, not fallback; got %d calls", runner.calls)
 	}
 	if sess.GetMode() != session.ModeNativeConversation {
 		t.Fatal("quota failure unexpectedly switched session to fallback mode")
+	}
+}
+
+func TestAgyAgent_Prompt_RetriesQuotaThenContinuesNativeConversation(t *testing.T) {
+	agent := newTestAgent(t)
+	var waits []time.Duration
+	agent.sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return ctx.Err()
+	}
+	runner := &scriptedRunner{script: []scriptedCall{
+		{resp: &agy.Response{ConversationID: "conv-123"}, err: &agy.ProcessError{ExitCode: 1, Detail: "status 429: overloaded"}},
+		{resp: &agy.Response{Output: "resumed", ConversationID: "conv-123"}},
+	}}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	sess, ok := agent.store.Get(string(sessResp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	sess.SetConversationID("conv-123")
+	sess.AddUserMessage("previous")
+	sess.AddAssistantMessage("answer")
+
+	resp, err := agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("next")},
+	})
+	if err != nil {
+		t.Fatalf("Prompt failed after retry: %v", err)
+	}
+	if resp.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("stop reason = %s", resp.StopReason)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected 2 native calls, got %d", len(runner.calls))
+	}
+	if runner.calls[0].Prompt == "" || !strings.Contains(runner.calls[0].Prompt, "next") {
+		t.Fatalf("first prompt should keep the user text, got %q", runner.calls[0].Prompt)
+	}
+	if runner.calls[1].Prompt != providerLimitContinuePrompt {
+		t.Fatalf("retry prompt = %q, want continue cue", runner.calls[1].Prompt)
+	}
+	if runner.calls[1].ConversationID != "conv-123" {
+		t.Fatalf("retry conversation = %q", runner.calls[1].ConversationID)
+	}
+	if len(waits) != 1 || waits[0] != 2*time.Second {
+		t.Fatalf("backoff waits = %#v", waits)
+	}
+}
+
+func TestAgyAgent_Prompt_FirstTurnQuotaRetriesOriginalPromptWithoutConversation(t *testing.T) {
+	agent := newTestAgent(t)
+	agent.cfg.InjectExecutionEnvNote = false
+	runner := &scriptedRunner{script: []scriptedCall{
+		{err: &agy.ProcessError{ExitCode: 1, Detail: "code 429"}},
+		{resp: &agy.Response{Output: "ok", ConversationID: "conv-new"}},
+	}}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("start work")},
+	})
+	if err != nil {
+		t.Fatalf("Prompt failed after retry: %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(runner.calls))
+	}
+	if runner.calls[0].ConversationID != "" || runner.calls[1].ConversationID != "" {
+		t.Fatalf("first-turn retries without a conversation id must not pass --conversation: %#v", runner.calls)
+	}
+	if runner.calls[0].Prompt != "start work" || runner.calls[1].Prompt != "start work" {
+		t.Fatalf("expected original prompt on both attempts, got %#v %#v", runner.calls[0].Prompt, runner.calls[1].Prompt)
+	}
+}
+
+func TestAgyAgent_Prompt_FirstTurnQuotaContinuesAfterStreamConversationID(t *testing.T) {
+	agent := newTestAgent(t)
+	agent.cfg.InjectExecutionEnvNote = false
+	runner := &scriptedRunner{script: []scriptedCall{
+		{resp: &agy.Response{ConversationID: "conv-from-stream"}, err: &agy.ProcessError{ExitCode: 1, Detail: "RESOURCE_EXHAUSTED"}},
+		{resp: &agy.Response{Output: "ok", ConversationID: "conv-from-stream"}},
+	}}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("start work")},
+	})
+	if err != nil {
+		t.Fatalf("Prompt failed after retry: %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(runner.calls))
+	}
+	if runner.calls[0].ConversationID != "" {
+		t.Fatalf("first attempt should create a conversation, got %q", runner.calls[0].ConversationID)
+	}
+	if runner.calls[1].ConversationID != "conv-from-stream" || runner.calls[1].Prompt != providerLimitContinuePrompt {
+		t.Fatalf("second attempt = %#v", runner.calls[1])
 	}
 }
 

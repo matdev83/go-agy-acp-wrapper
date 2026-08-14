@@ -49,6 +49,24 @@ Prompts exceeding the configurable byte threshold (default 8KB) are written unde
 first session for a workdir starts, when the last session in that workdir closes,
 and on wrapper shutdown.
 
+### Provider 429 / quota continue
+
+A mid-turn Gemini `429` / `RESOURCE_EXHAUSTED` used to fail the ACP `session/prompt`
+immediately (or, before fail-fast, hang until `--timeout-seconds`). The wrapper now
+keeps that prompt open and retries the **native** `agy --conversation` turn:
+
+1. Parse `retryDelay` / "retry in …" / `Retry-After` when present; otherwise use
+   exponential backoff (`2s` … `60s`).
+2. Wait up to the remaining per-turn timeout (or `--quota-retry-max-wait-seconds`).
+3. Stream a short "waiting … before retry" notice so the ACP client is not silent.
+4. If the failed attempt already produced a conversation ID, send a continue cue
+   instead of replaying the user prompt.
+5. After the attempt budget is exhausted, still return ACP `-32003` and **do not**
+   dump fallback context (that would burn more quota).
+
+This is independent of the virtual-context fallback used for other native-resume
+failures.
+
 ### Response Extraction
 When `agy --print` produces no stdout (a known platform-specific issue), the
 wrapper extracts the model's response directly from agy's transcript log at
@@ -116,6 +134,8 @@ Use `go-agy-acp-wrapper --version` for executable validation without starting AC
 | `AGY_MODEL` | _(empty = catalog default)_ | Default model for new sessions (e.g. `gemini-3.6-flash-high`) |
 | `AGY_PROMPT_THRESHOLD` | `8000` | Byte threshold above which prompts are written to temp files |
 | `AGY_TIMEOUT_SECONDS` | `14400` (4 hours) | Per-turn execution timeout in seconds. Forwarded to agy as `--print-timeout` (agy's own print-mode default is 5 minutes). |
+| `AGY_QUOTA_RETRY_ATTEMPTS` | `5` | How many `agy --print` invocations to make for one ACP prompt after a 429 / quota error (1 initial + retries). |
+| `AGY_QUOTA_RETRY_MAX_WAIT_SECONDS` | `0` (remaining turn timeout) | Cap for a single backoff wait. `0` waits up to the remaining per-turn timeout (so a 3h quota reset can still resume inside a 4h turn). |
 | `AGY_SKIP_PERMISSIONS` | `true` | Whether to pass `--dangerously-skip-permissions` to `agy`; set to `false` to opt out |
 | `AGY_ACP_SKIP_ENV_NOTE` | `false` | Set to `true` to skip the once-per-session execution-environment steering note |
 
@@ -127,6 +147,8 @@ Equivalent CLI flags are available and override environment values:
 | `--model <model>` | Default model for new sessions |
 | `--prompt-threshold <bytes>` | Byte threshold above which prompts are written to workdir files |
 | `--timeout-seconds <seconds>` | Per-turn execution timeout and agy `--print-timeout` |
+| `--quota-retry-attempts <n>` | Native continue retries after 429 / quota errors |
+| `--quota-retry-max-wait-seconds <seconds>` | Cap for a single 429 backoff (`0` = remaining turn timeout) |
 | `--skip-permissions` | Force-enable `--dangerously-skip-permissions` |
 | `--no-skip-permissions` | Opt out of `--dangerously-skip-permissions` |
 | `--execution-env-note` | Force-enable the once-per-session execution-environment note |

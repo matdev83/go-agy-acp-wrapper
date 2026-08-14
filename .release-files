@@ -32,6 +32,8 @@ internal/agy/process_unix.go
 internal/agy/process_unix_test.go
 internal/agy/process_windows.go
 internal/agy/process_windows_test.go
+internal/agy/retry.go
+internal/agy/retry_test.go
 internal/agy/runner.go
 internal/agy/runner_test.go
 internal/agy/signal_unix.go
