@@ -117,6 +117,7 @@ Use `go-agy-acp-wrapper --version` for executable validation without starting AC
 | `AGY_PROMPT_THRESHOLD` | `8000` | Byte threshold above which prompts are written to temp files |
 | `AGY_TIMEOUT_SECONDS` | `14400` (4 hours) | Per-turn execution timeout in seconds. Forwarded to agy as `--print-timeout` (agy's own print-mode default is 5 minutes). |
 | `AGY_SKIP_PERMISSIONS` | `true` | Whether to pass `--dangerously-skip-permissions` to `agy`; set to `false` to opt out |
+| `AGY_ACP_SKIP_ENV_NOTE` | `false` | Set to `true` to skip the once-per-session execution-environment steering note |
 
 Equivalent CLI flags are available and override environment values:
 
@@ -128,7 +129,18 @@ Equivalent CLI flags are available and override environment values:
 | `--timeout-seconds <seconds>` | Per-turn execution timeout and agy `--print-timeout` |
 | `--skip-permissions` | Force-enable `--dangerously-skip-permissions` |
 | `--no-skip-permissions` | Opt out of `--dangerously-skip-permissions` |
+| `--execution-env-note` | Force-enable the once-per-session execution-environment note |
+| `--no-execution-env-note` | Opt out of the execution-environment note |
 | `--version` | Print wrapper version and exit |
+
+### Subagent execution-environment note
+
+On the first `session/prompt` of each ACP session, the wrapper prepends a short
+steering note so models running inside `agy` do not try to call parent-harness
+tools that were copied into the task prompt. Later turns are left unchanged
+because native `agy --conversation` resume already keeps the first-turn note.
+The note is skipped when the incoming prompt already starts with it, and can be
+disabled with `AGY_ACP_SKIP_ENV_NOTE=true` or `--no-execution-env-note`.
 
 ### Model Selection
 
@@ -247,6 +259,8 @@ internal/
 - Clients that spawn the wrapper with `--timeout-seconds` (including LIP
   `process_timeout`) override the 4-hour default. Keep that value high enough for
   long tool waits; agy's own `--print-timeout` default is 5 minutes.
+- The execution-environment note is a mitigation, not a guarantee. Parent
+  harnesses should still send a task rather than dumping their own tool catalog.
 
 ## Platform Notes
 

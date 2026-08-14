@@ -20,11 +20,12 @@ import (
 func newTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
-		AgyBinary:       "echo",
-		HomeDir:         t.TempDir(),
-		PromptThreshold: 8000,
-		TimeoutSeconds:  30,
-		SkipPerms:       true,
+		AgyBinary:              "echo",
+		HomeDir:                t.TempDir(),
+		PromptThreshold:        8000,
+		TimeoutSeconds:         30,
+		SkipPerms:              true,
+		InjectExecutionEnvNote: true,
 	}
 }
 
@@ -344,6 +345,139 @@ func (r *errorRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, o
 	return nil, r.err
 }
 
+type recordingRunner struct {
+	mu    sync.Mutex
+	calls []agy.ExecuteOpts
+	err   error
+}
+
+func (r *recordingRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return r.ExecuteStream(ctx, opts, nil)
+}
+
+func (r *recordingRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, opts)
+	r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	return &agy.Response{Output: "ok", ConversationID: "conv-env-note"}, nil
+}
+
+func (r *recordingRunner) prompts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.calls))
+	for _, call := range r.calls {
+		if call.PromptFilePath != "" {
+			out = append(out, "@"+call.PromptFilePath)
+			continue
+		}
+		out = append(out, call.Prompt)
+	}
+	return out
+}
+
+func TestAgyAgent_Prompt_InjectsExecutionEnvNoteOnce(t *testing.T) {
+	agent := newTestAgent(t)
+	runner := &recordingRunner{err: errors.New("stop before session update")}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("run the tests")},
+	})
+	if err == nil {
+		t.Fatal("expected runner error")
+	}
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("follow up")},
+	})
+	if err == nil {
+		t.Fatal("expected runner error")
+	}
+
+	prompts := runner.prompts()
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 runner calls, got %d", len(prompts))
+	}
+	wantFirst := executionEnvNote + "\n\nrun the tests"
+	if prompts[0] != wantFirst {
+		t.Fatalf("first prompt = %q", prompts[0])
+	}
+	if prompts[1] != "follow up" {
+		t.Fatalf("second prompt should not repeat the note, got %q", prompts[1])
+	}
+
+	sess, ok := agent.store.Get(string(sessResp.SessionId))
+	if !ok {
+		t.Fatal("session not found")
+	}
+	if !sess.EnvNoteInjected() {
+		t.Fatal("expected session to remember env-note injection")
+	}
+	transcript := sess.GetTranscript()
+	if len(transcript) < 2 || transcript[0].Content != wantFirst || transcript[1].Content != "follow up" {
+		t.Fatalf("unexpected transcript: %+v", transcript)
+	}
+}
+
+func TestAgyAgent_Prompt_ExecutionEnvNoteOptOut(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.InjectExecutionEnvNote = false
+	agent := NewAgyAgent(cfg)
+	defer agent.Close()
+	runner := &recordingRunner{err: errors.New("stop before session update")}
+	agent.runner = runner
+	agent.modelCatalog = agy.NewModelCatalogFromIDs("gemini-3.5-flash-high")
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("run the tests")},
+	})
+	if err == nil {
+		t.Fatal("expected runner error")
+	}
+	prompts := runner.prompts()
+	if len(prompts) != 1 || prompts[0] != "run the tests" {
+		t.Fatalf("opt-out should leave prompt unchanged, got %#v", prompts)
+	}
+}
+
+func TestAgyAgent_Prompt_DoesNotDuplicateExistingExecutionEnvNote(t *testing.T) {
+	agent := newTestAgent(t)
+	runner := &recordingRunner{err: errors.New("stop before session update")}
+	agent.runner = runner
+
+	sessResp, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	incoming := executionEnvNote + "\n\nrun the tests"
+	_, err = agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: sessResp.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock(incoming)},
+	})
+	if err == nil {
+		t.Fatal("expected runner error")
+	}
+	prompts := runner.prompts()
+	if len(prompts) != 1 || prompts[0] != incoming {
+		t.Fatalf("expected existing note to be preserved, got %#v", prompts)
+	}
+}
+
 func TestAgyAgent_Prompt_ReturnsDescriptiveQuotaRequestError(t *testing.T) {
 	agent := newTestAgent(t)
 	runner := &errorRunner{err: &agy.ProcessError{
@@ -564,8 +698,12 @@ func TestAgyAgent_Prompt_RejectsConcurrentPromptWithoutTranscriptMutation(t *tes
 		t.Fatal("session not found")
 	}
 	transcript := sess.GetTranscript()
-	if len(transcript) != 1 || transcript[0].Content != "first" {
-		t.Fatalf("expected only first prompt in transcript, got %#v", transcript)
+	wantFirst := executionEnvNote + "\n\nfirst"
+	if len(transcript) != 1 {
+		t.Fatalf("expected 1 transcript message, got %#v", transcript)
+	}
+	if transcript[0].Content != wantFirst {
+		t.Fatalf("first prompt mismatch\ngot  (%d): %q\nwant (%d): %q", len(transcript[0].Content), transcript[0].Content, len(wantFirst), wantFirst)
 	}
 
 	if err := agent.Cancel(context.Background(), acp.CancelNotification{SessionId: sessResp.SessionId}); err != nil {

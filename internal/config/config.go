@@ -20,21 +20,23 @@ const (
 )
 
 type Config struct {
-	AgyBinary       string
-	HomeDir         string
-	PromptThreshold int
-	TimeoutSeconds  int
-	DefaultModel    string
-	SkipPerms       bool
+	AgyBinary              string
+	HomeDir                string
+	PromptThreshold        int
+	TimeoutSeconds         int
+	DefaultModel           string
+	SkipPerms              bool
+	InjectExecutionEnvNote bool
 }
 
 type CLIOptions struct {
-	AgyBinary       string
-	Model           string
-	PromptThreshold int
-	TimeoutSeconds  int
-	SkipPerms       *bool
-	ListModels      bool
+	AgyBinary              string
+	Model                  string
+	PromptThreshold        int
+	TimeoutSeconds         int
+	SkipPerms              *bool
+	InjectExecutionEnvNote *bool
+	ListModels             bool
 }
 
 func Load() (*Config, error) {
@@ -48,12 +50,13 @@ func LoadWithOptions(opts CLIOptions) (*Config, error) {
 	}
 
 	cfg := &Config{
-		AgyBinary:       getEnvOrDefault("AGY_BINARY", detectAgyBinary()),
-		HomeDir:         home,
-		PromptThreshold: getEnvIntOrDefault("AGY_PROMPT_THRESHOLD", DefaultPromptThreshold),
-		TimeoutSeconds:  getEnvIntOrDefault("AGY_TIMEOUT_SECONDS", DefaultTimeoutSeconds),
-		DefaultModel:    os.Getenv("AGY_MODEL"),
-		SkipPerms:       getEnvBoolOrDefault("AGY_SKIP_PERMISSIONS", true),
+		AgyBinary:              getEnvOrDefault("AGY_BINARY", detectAgyBinary()),
+		HomeDir:                home,
+		PromptThreshold:        getEnvIntOrDefault("AGY_PROMPT_THRESHOLD", DefaultPromptThreshold),
+		TimeoutSeconds:         getEnvIntOrDefault("AGY_TIMEOUT_SECONDS", DefaultTimeoutSeconds),
+		DefaultModel:           os.Getenv("AGY_MODEL"),
+		SkipPerms:              getEnvBoolOrDefault("AGY_SKIP_PERMISSIONS", true),
+		InjectExecutionEnvNote: !getEnvBoolOrDefault("AGY_ACP_SKIP_ENV_NOTE", false),
 	}
 	if opts.AgyBinary != "" {
 		cfg.AgyBinary = opts.AgyBinary
@@ -70,6 +73,9 @@ func LoadWithOptions(opts CLIOptions) (*Config, error) {
 	if opts.SkipPerms != nil {
 		cfg.SkipPerms = *opts.SkipPerms
 	}
+	if opts.InjectExecutionEnvNote != nil {
+		cfg.InjectExecutionEnvNote = *opts.InjectExecutionEnvNote
+	}
 
 	return cfg, nil
 }
@@ -81,6 +87,8 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	var opts CLIOptions
 	var skipPerms bool
 	var noSkipPerms bool
+	var envNote bool
+	var noEnvNote bool
 	var version bool
 	fs.StringVar(&opts.AgyBinary, "agy-binary", "", "agy executable path")
 	fs.StringVar(&opts.Model, "model", "", "default agy model")
@@ -88,6 +96,8 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	fs.IntVar(&opts.TimeoutSeconds, "timeout-seconds", 0, "agy execution and --print-timeout (seconds)")
 	fs.BoolVar(&skipPerms, "skip-permissions", false, "pass --dangerously-skip-permissions to agy")
 	fs.BoolVar(&noSkipPerms, "no-skip-permissions", false, "do not pass --dangerously-skip-permissions to agy")
+	fs.BoolVar(&envNote, "execution-env-note", false, "prepend the execution-environment steering note (default)")
+	fs.BoolVar(&noEnvNote, "no-execution-env-note", false, "do not prepend the execution-environment steering note")
 	fs.BoolVar(&version, "version", false, "print version and exit")
 	fs.BoolVar(&opts.ListModels, "list-models", false, "print canonical model IDs and exit")
 
@@ -97,6 +107,9 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	if skipPerms && noSkipPerms {
 		return CLIOptions{}, false, fmt.Errorf("--skip-permissions and --no-skip-permissions are mutually exclusive")
 	}
+	if envNote && noEnvNote {
+		return CLIOptions{}, false, fmt.Errorf("--execution-env-note and --no-execution-env-note are mutually exclusive")
+	}
 	if skipPerms {
 		v := true
 		opts.SkipPerms = &v
@@ -104,6 +117,14 @@ func ParseCLIOptions(args []string) (CLIOptions, bool, error) {
 	if noSkipPerms {
 		v := false
 		opts.SkipPerms = &v
+	}
+	if envNote {
+		v := true
+		opts.InjectExecutionEnvNote = &v
+	}
+	if noEnvNote {
+		v := false
+		opts.InjectExecutionEnvNote = &v
 	}
 	return opts, version, nil
 }

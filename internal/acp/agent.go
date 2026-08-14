@@ -160,6 +160,10 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	if sess.IsClosed() {
 		return acp.PromptResponse{}, fmt.Errorf("session %s is closed", sid)
 	}
+	if a.cfg.InjectExecutionEnvNote {
+		promptText = applyExecutionEnvNote(promptText, sess.EnvNoteInjected())
+		sess.MarkEnvNoteInjected()
+	}
 	sess.AddUserMessage(promptText)
 
 	var streamedMu sync.Mutex
