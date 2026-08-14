@@ -36,6 +36,7 @@ type Context struct {
 	Mode            Mode
 	Transcript      []Message
 	TurnCount       int
+	envNoteInjected bool
 	closed          bool
 }
 
@@ -129,6 +130,18 @@ func (c *Context) GetTurnCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.TurnCount
+}
+
+func (c *Context) EnvNoteInjected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.envNoteInjected
+}
+
+func (c *Context) MarkEnvNoteInjected() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.envNoteInjected = true
 }
 
 func (c *Context) Close() {

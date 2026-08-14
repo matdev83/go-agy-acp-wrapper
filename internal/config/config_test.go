@@ -112,3 +112,60 @@ func TestLoadWithOptions_OverridesEnv(t *testing.T) {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
+
+func TestLoad_ExecutionEnvNoteDefaultOn(t *testing.T) {
+	t.Setenv("AGY_ACP_SKIP_ENV_NOTE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !cfg.InjectExecutionEnvNote {
+		t.Fatal("expected execution env note to be injected by default")
+	}
+}
+
+func TestLoad_ExecutionEnvNoteOptOutEnv(t *testing.T) {
+	t.Setenv("AGY_ACP_SKIP_ENV_NOTE", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.InjectExecutionEnvNote {
+		t.Fatal("expected AGY_ACP_SKIP_ENV_NOTE=true to disable injection")
+	}
+}
+
+func TestParseCLIOptions_NoExecutionEnvNote(t *testing.T) {
+	opts, showVersion, err := ParseCLIOptions([]string{"--no-execution-env-note"})
+	if err != nil {
+		t.Fatalf("ParseCLIOptions failed: %v", err)
+	}
+	if showVersion {
+		t.Fatal("did not expect version mode")
+	}
+	if opts.InjectExecutionEnvNote == nil || *opts.InjectExecutionEnvNote {
+		t.Fatalf("expected env-note opt-out, got %+v", opts.InjectExecutionEnvNote)
+	}
+}
+
+func TestParseCLIOptions_ExecutionEnvNoteFlagsMutuallyExclusive(t *testing.T) {
+	_, _, err := ParseCLIOptions([]string{"--execution-env-note", "--no-execution-env-note"})
+	if err == nil {
+		t.Fatal("expected mutually exclusive flag error")
+	}
+}
+
+func TestLoadWithOptions_ExecutionEnvNoteOverridesEnv(t *testing.T) {
+	t.Setenv("AGY_ACP_SKIP_ENV_NOTE", "true")
+	v := true
+
+	cfg, err := LoadWithOptions(CLIOptions{InjectExecutionEnvNote: &v})
+	if err != nil {
+		t.Fatalf("LoadWithOptions failed: %v", err)
+	}
+	if !cfg.InjectExecutionEnvNote {
+		t.Fatal("expected CLI override to re-enable env-note injection")
+	}
+}

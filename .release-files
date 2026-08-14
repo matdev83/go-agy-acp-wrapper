@@ -18,6 +18,8 @@ go.mod
 go.sum
 internal/acp/agent.go
 internal/acp/agent_test.go
+internal/acp/envnote.go
+internal/acp/envnote_test.go
 internal/agy/conversation.go
 internal/agy/conversation_test.go
 internal/agy/coordinator.go

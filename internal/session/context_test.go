@@ -115,3 +115,14 @@ func TestContext_Close(t *testing.T) {
 		t.Fatal("expected closed after Close()")
 	}
 }
+
+func TestContext_EnvNoteInjected(t *testing.T) {
+	ctx := NewContext("sess_test", "/workspace")
+	if ctx.EnvNoteInjected() {
+		t.Fatal("expected env note not injected initially")
+	}
+	ctx.MarkEnvNoteInjected()
+	if !ctx.EnvNoteInjected() {
+		t.Fatal("expected env note marked injected")
+	}
+}
