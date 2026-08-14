@@ -274,7 +274,7 @@ func TestAgyJSONStream_UsesAgentDeltasAndAuthoritativeResult(t *testing.T) {
 	var chunks []string
 	stream.read(strings.NewReader(input), func(event StreamEvent) {
 		chunks = append(chunks, event.Text)
-	})
+	}, nil)
 
 	if got := strings.Join(chunks, ""); got != "first part" {
 		t.Fatalf("expected only live agent deltas, got %q", got)
@@ -297,7 +297,7 @@ func TestAgyJSONStream_EmitsToolProgressWithoutTextDelta(t *testing.T) {
 	var events []StreamEvent
 	stream.read(strings.NewReader(input), func(event StreamEvent) {
 		events = append(events, event)
-	})
+	}, nil)
 
 	if len(events) != 2 {
 		t.Fatalf("expected tool start and completion, got %#v", events)
@@ -317,7 +317,7 @@ func TestAgyJSONStream_WaitingResultIsTimeout(t *testing.T) {
 	}, "\n")
 
 	var stream agyJSONStream
-	stream.read(strings.NewReader(input), nil)
+	stream.read(strings.NewReader(input), nil, nil)
 	err := stream.terminalError(0)
 	if !IsTimeoutError(err) {
 		t.Fatalf("expected timeout error, got %v", err)
@@ -334,7 +334,7 @@ func TestAgyJSONStream_FailedQuotaResultIsProviderLimit(t *testing.T) {
 	}, "\n")
 
 	var stream agyJSONStream
-	stream.read(strings.NewReader(input), nil)
+	stream.read(strings.NewReader(input), nil, nil)
 	err := stream.terminalError(1)
 	if !IsProviderLimitError(err) {
 		t.Fatalf("expected provider limit error, got %v", err)
@@ -344,10 +344,147 @@ func TestAgyJSONStream_FailedQuotaResultIsProviderLimit(t *testing.T) {
 	}
 }
 
+func TestAgyJSONStream_DetectsQuotaBeforeEOF(t *testing.T) {
+	pr, pw := io.Pipe()
+	var stream agyJSONStream
+	got := make(chan string, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream.read(pr, nil, func(detail string) {
+			select {
+			case got <- detail:
+			default:
+			}
+		})
+	}()
+
+	line := `{"event":"error","error":"The model API is currently overloaded and may experience intermittent errors.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h23m40s.","error_code":429}` + "\n"
+	if _, err := pw.Write([]byte(line)); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	select {
+	case detail := <-got:
+		if !strings.Contains(detail, "RESOURCE_EXHAUSTED") || !strings.Contains(detail, "Individual quota") {
+			t.Fatalf("expected RESOURCE_EXHAUSTED quota detail, got %q", detail)
+		}
+		if strings.Contains(detail, "overloaded") && !strings.Contains(detail, "RESOURCE_EXHAUSTED") {
+			t.Fatalf("overloaded text should not replace quota detail: %q", detail)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected quota callback before stream EOF")
+	}
+
+	if err := pw.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream reader did not finish after close")
+	}
+}
+
+func TestPreferredProviderLimitDetail_PrefersResourceExhausted(t *testing.T) {
+	detail, ok := extractProviderLimitDetail(strings.Join([]string{
+		"The model API is currently overloaded and may experience intermittent errors.",
+		"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h23m40s.",
+	}, "\n"))
+	if !ok {
+		t.Fatal("expected provider limit detection")
+	}
+	if !strings.Contains(detail, "RESOURCE_EXHAUSTED") || !strings.Contains(detail, "Individual quota") {
+		t.Fatalf("expected exact quota line, got %q", detail)
+	}
+}
+
+func TestNonInteractiveRunner_Execute_QuotaHangFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	var script string
+	if runtime.GOOS == "windows" {
+		script = filepath.Join(dir, "quota-hang.cmd")
+		body := "@echo off\r\n" +
+			"echo The model API is currently overloaded and may experience intermittent errors. 1>&2\r\n" +
+			"echo RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h23m40s. 1>&2\r\n" +
+			"ping -n 60 127.0.0.1 >nul\r\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	} else {
+		script = filepath.Join(dir, "quota-hang.sh")
+		body := "#!/bin/sh\n" +
+			"printf '%s\\n' 'The model API is currently overloaded and may experience intermittent errors.' >&2\n" +
+			"printf '%s\\n' 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h23m40s.' >&2\n" +
+			"sleep 60\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	}
+
+	r := NewNonInteractiveRunner(script, dir)
+	started := time.Now()
+	_, err := r.Execute(context.Background(), ExecuteOpts{
+		Cwd:     dir,
+		Prompt:  "hello",
+		Timeout: 4 * time.Hour,
+	})
+	elapsed := time.Since(started)
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if ShouldFallback(err) {
+		t.Fatal("quota hang should not fallback")
+	}
+	if !strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+		t.Fatalf("expected RESOURCE_EXHAUSTED in error, got %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("quota hang waited too long: %s", elapsed)
+	}
+}
+
+func TestNonInteractiveRunner_Execute_StdoutQuotaHangFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	var script string
+	if runtime.GOOS == "windows" {
+		script = filepath.Join(dir, "quota-stdout-hang.cmd")
+		body := "@echo off\r\n" +
+			"echo RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h\r\n" +
+			"ping -n 60 127.0.0.1 >nul\r\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	} else {
+		script = filepath.Join(dir, "quota-stdout-hang.sh")
+		body := "#!/bin/sh\n" +
+			"printf '%s\\n' '{\"event\":\"error\",\"error\":\"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h\",\"error_code\":429}'\n" +
+			"sleep 60\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+	}
+
+	r := NewNonInteractiveRunner(script, dir)
+	started := time.Now()
+	_, err := r.Execute(context.Background(), ExecuteOpts{
+		Cwd:     dir,
+		Prompt:  "hello",
+		Timeout: 4 * time.Hour,
+	})
+	elapsed := time.Since(started)
+	if !IsProviderLimitError(err) {
+		t.Fatalf("expected provider limit error, got %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("stdout quota hang waited too long: %s", elapsed)
+	}
+}
+
 func TestAgyJSONStream_SuccessResultIsNotError(t *testing.T) {
 	input := `{"event":"result","result":{"conversation_id":"conv-ok","status":"SUCCESS","response":"done"}}`
 	var stream agyJSONStream
-	stream.read(strings.NewReader(input), nil)
+	stream.read(strings.NewReader(input), nil, nil)
 	if err := stream.terminalError(0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

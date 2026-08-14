@@ -332,6 +332,51 @@ func turnOutput(resp *agy.Response, err error, opts agy.ExecuteOpts) (string, er
 	return resp.Output, nil
 }
 
+const maxToolTitleCommandChars = 120
+
+func toolCallTitle(name string, rawInput any) string {
+	title := strings.TrimSpace(name)
+	if title == "" {
+		title = "AGY tool"
+	}
+	command := commandLineFromInput(rawInput)
+	if command == "" {
+		return title
+	}
+	if len(command) > maxToolTitleCommandChars {
+		command = command[:maxToolTitleCommandChars] + "…"
+	}
+	return title + ": " + command
+}
+
+func commandLineFromInput(rawInput any) string {
+	fields, ok := rawInput.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"CommandLine", "commandLine", "command", "cmd"} {
+		value, ok := fields[key].(string)
+		if !ok {
+			continue
+		}
+		if command := strings.TrimSpace(value); command != "" {
+			return command
+		}
+	}
+	return ""
+}
+
+func toolCallUpdateStatus(state string) acp.ToolCallStatus {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "DONE", "COMPLETED", "COMPLETE", "SUCCESS":
+		return acp.ToolCallStatusCompleted
+	case "ERROR", "FAILED", "FAIL", "CANCELLED", "CANCELED", "REJECTED":
+		return acp.ToolCallStatusFailed
+	default:
+		return acp.ToolCallStatusInProgress
+	}
+}
+
 func streamEventUpdate(event agy.StreamEvent) (acp.SessionUpdate, bool) {
 	switch event.Kind {
 	case agy.StreamEventText:
@@ -340,21 +385,14 @@ func streamEventUpdate(event agy.StreamEvent) (acp.SessionUpdate, bool) {
 		}
 		return acp.UpdateAgentMessageText(event.Text), true
 	case agy.StreamEventToolStart:
-		title := event.ToolName
-		if title == "" {
-			title = "AGY tool"
-		}
+		title := toolCallTitle(event.ToolName, event.RawInput)
 		opts := []acp.ToolCallStartOpt{acp.WithStartStatus(acp.ToolCallStatusInProgress)}
 		if event.RawInput != nil {
 			opts = append(opts, acp.WithStartRawInput(event.RawInput))
 		}
 		return acp.StartToolCall(acp.ToolCallId(event.ToolID), title, opts...), true
 	case agy.StreamEventToolUpdate:
-		status := acp.ToolCallStatusCompleted
-		if event.ToolState != "DONE" {
-			status = acp.ToolCallStatusFailed
-		}
-		opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
+		opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(toolCallUpdateStatus(event.ToolState))}
 		if event.RawOutput != nil {
 			opts = append(opts, acp.WithUpdateRawOutput(event.RawOutput))
 		}
