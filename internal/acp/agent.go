@@ -28,6 +28,7 @@ type AgyAgent struct {
 	modelCatalog *agy.ModelCatalog
 	promptWriter *agy.PromptFileWriter
 	coordinator  *agy.RepoCoordinator
+	sleep        func(context.Context, time.Duration) error
 	mu           sync.Mutex
 	workdirs     map[string]int
 	cancels      map[string]activePrompt
@@ -55,6 +56,7 @@ func NewAgyAgent(cfg *config.Config) *AgyAgent {
 		modelCatalog: agy.NewModelCatalog(cfg.AgyBinary),
 		promptWriter: agy.NewPromptFileWriter(cfg.PromptThreshold),
 		coordinator:  agy.NewRepoCoordinator(cfg.AgyConfigDir()),
+		sleep:        sleepContext,
 		workdirs:     make(map[string]int),
 		cancels:      make(map[string]activePrompt),
 		finalizers:   make(map[string]*sessionFinalizer),
@@ -173,6 +175,9 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		if !ok {
 			return
 		}
+		if a.conn == nil {
+			return
+		}
 		if err := a.conn.SessionUpdate(promptCtx, acp.SessionNotification{
 			SessionId: params.SessionId,
 			Update:    update,
@@ -205,7 +210,7 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		tail = response[len(streamedText):]
 	}
 
-	if tail != "" {
+	if tail != "" && a.conn != nil {
 		if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
 			SessionId: params.SessionId,
 			Update:    acp.UpdateAgentMessageText(tail),
@@ -218,6 +223,99 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 }
 
 func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promptText string, onEvent func(agy.StreamEvent)) (string, error) {
+	attempts := a.quotaRetryAttempts()
+	turnDeadline := time.Now().Add(time.Duration(a.cfg.TimeoutSeconds) * time.Second)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(turnDeadline) {
+		turnDeadline = deadline
+	}
+
+	prompt := promptText
+	var native nativeAttemptState
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		remaining := time.Until(turnDeadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		timeout := remaining
+		configured := time.Duration(a.cfg.TimeoutSeconds) * time.Second
+		if configured > 0 && (timeout == 0 || timeout > configured) {
+			timeout = configured
+		}
+		out, err := a.executeTurnOnce(ctx, sess, prompt, timeout, onEvent, &native)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return "", err
+		}
+		if !agy.IsProviderLimitError(err) || attempt+1 >= attempts {
+			return "", err
+		}
+		wait, ok := agy.NextProviderLimitWait(attempt, err, remaining, a.quotaRetryMaxWait())
+		if !ok {
+			return "", err
+		}
+		notice := fmt.Sprintf("\nProvider rate limit; waiting %s before retry %d/%d.\n", wait.Round(time.Second), attempt+2, attempts)
+		if onEvent != nil {
+			onEvent(agy.StreamEvent{Kind: agy.StreamEventText, Text: notice})
+		}
+		slog.Warn("provider rate limit, backing off before native continue",
+			"sessionId", sess.ID,
+			"wait", wait,
+			"attempt", attempt+2,
+			"attempts", attempts,
+			"error", err,
+		)
+		if sleepErr := a.sleep(ctx, wait); sleepErr != nil {
+			return "", sleepErr
+		}
+		if sess.GetConversationID() != "" {
+			prompt = providerLimitContinuePrompt
+		}
+	}
+	return "", lastErr
+}
+
+const providerLimitContinuePrompt = "Continue from where you left off. Do not restart the task."
+
+type nativeAttemptState struct {
+	previousID     string
+	startedAt      time.Time
+	snapshotDone   bool
+	snapshotFailed bool
+}
+
+func (a *AgyAgent) quotaRetryAttempts() int {
+	if a.cfg == nil || a.cfg.QuotaRetryAttempts < 1 {
+		return config.DefaultQuotaRetryAttempts
+	}
+	return a.cfg.QuotaRetryAttempts
+}
+
+func (a *AgyAgent) quotaRetryMaxWait() time.Duration {
+	if a.cfg == nil || a.cfg.QuotaRetryMaxWaitSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(a.cfg.QuotaRetryMaxWaitSeconds) * time.Second
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (a *AgyAgent) executeTurnOnce(ctx context.Context, sess *session.Context, promptText string, timeout time.Duration, onEvent func(agy.StreamEvent), native *nativeAttemptState) (string, error) {
 	mode := sess.GetMode()
 	convID := sess.GetConversationID()
 	turnCount := sess.GetTurnCount()
@@ -230,7 +328,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 	opts := agy.ExecuteOpts{
 		Cwd:       sess.Cwd,
 		Model:     nativeModel,
-		Timeout:   time.Duration(a.cfg.TimeoutSeconds) * time.Second,
+		Timeout:   timeout,
 		SkipPerms: a.cfg.SkipPerms,
 	}
 
@@ -238,7 +336,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 	case mode == session.ModeFallbackContext:
 		return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 
-	case convID != "" && turnCount > 1:
+	case convID != "":
 		opts.ConversationID = convID
 		opts.Prompt = promptText
 		if a.promptWriter.NeedsFile(promptText) {
@@ -251,6 +349,7 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		}
 
 		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
+		captureConversationID(sess, resp)
 		out, err := turnOutput(resp, err, opts)
 		if err != nil {
 			if !agy.ShouldFallback(err) {
@@ -263,13 +362,22 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		return out, nil
 
 	default:
-		previousID, err := a.discoverer.SnapshotConversationID(ctx, sess.Cwd)
-		if err != nil {
-			slog.Warn("conversation cache snapshot failed, using fallback context", "error", err, "sessionId", sess.ID)
+		if native.snapshotFailed {
 			sess.SwitchToFallback()
 			return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
 		}
-		startedAt := time.Now()
+		if !native.snapshotDone {
+			previousID, snapErr := a.discoverer.SnapshotConversationID(ctx, sess.Cwd)
+			native.snapshotDone = true
+			if snapErr != nil {
+				slog.Warn("conversation cache snapshot failed, using fallback context", "error", snapErr, "sessionId", sess.ID)
+				native.snapshotFailed = true
+				sess.SwitchToFallback()
+				return a.executeFallbackTurn(ctx, sess, opts, promptText, onEvent)
+			}
+			native.previousID = previousID
+			native.startedAt = time.Now()
+		}
 		opts.Prompt = promptText
 		if a.promptWriter.NeedsFile(promptText) {
 			path, err := a.promptWriter.WritePromptFile(sess.Cwd, sess.ID, turnCount, promptText)
@@ -281,22 +389,34 @@ func (a *AgyAgent) executeTurn(ctx context.Context, sess *session.Context, promp
 		}
 
 		resp, err := a.runner.ExecuteStream(ctx, opts, onEvent)
+		captureConversationID(sess, resp)
 		out, err := turnOutput(resp, err, opts)
 		if err != nil {
+			if sess.GetConversationID() == "" && !native.startedAt.IsZero() {
+				_ = a.discoverAndSetConversationID(ctx, sess, native.previousID, native.startedAt)
+			}
 			return "", err
 		}
 
-		if convID == "" {
-			if resp.ConversationID != "" {
-				sess.SetConversationID(resp.ConversationID)
-				slog.Info("conversation ID received from agy stream", "conversationId", resp.ConversationID, "sessionId", sess.ID)
-			} else if !a.discoverAndSetConversationID(ctx, sess, previousID, startedAt) {
+		if sess.GetConversationID() == "" {
+			if !a.discoverAndSetConversationID(ctx, sess, native.previousID, native.startedAt) {
 				sess.SwitchToFallback()
 			}
 		}
 
 		return out, nil
 	}
+}
+
+func captureConversationID(sess *session.Context, resp *agy.Response) {
+	if resp == nil || strings.TrimSpace(resp.ConversationID) == "" {
+		return
+	}
+	if sess.GetConversationID() == resp.ConversationID {
+		return
+	}
+	sess.SetConversationID(resp.ConversationID)
+	slog.Info("conversation ID received from agy stream", "conversationId", resp.ConversationID, "sessionId", sess.ID)
 }
 
 func (a *AgyAgent) executeFallbackTurn(ctx context.Context, sess *session.Context, opts agy.ExecuteOpts, promptText string, onEvent func(agy.StreamEvent)) (string, error) {
