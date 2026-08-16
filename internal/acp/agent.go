@@ -27,7 +27,6 @@ type AgyAgent struct {
 	discoverer   *agy.ConversationDiscoverer
 	modelCatalog *agy.ModelCatalog
 	promptWriter *agy.PromptFileWriter
-	coordinator  *agy.RepoCoordinator
 	sleep        func(context.Context, time.Duration) error
 	mu           sync.Mutex
 	workdirs     map[string]int
@@ -55,7 +54,6 @@ func NewAgyAgent(cfg *config.Config) *AgyAgent {
 		discoverer:   agy.NewConversationDiscoverer(cfg.AgyConfigDir()),
 		modelCatalog: agy.NewModelCatalog(cfg.AgyBinary),
 		promptWriter: agy.NewPromptFileWriter(cfg.PromptThreshold),
-		coordinator:  agy.NewRepoCoordinator(cfg.AgyConfigDir()),
 		sleep:        sleepContext,
 		workdirs:     make(map[string]int),
 		cancels:      make(map[string]activePrompt),
@@ -145,19 +143,6 @@ func (a *AgyAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pr
 		return acp.PromptResponse{}, fmt.Errorf("session %s already has an active prompt", sid)
 	}
 	defer a.finishPrompt(sid, token)
-
-	unlock, err := a.coordinator.Lock(promptCtx, sess.Cwd)
-	if err != nil {
-		if promptCtx.Err() == context.Canceled {
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
-		}
-		return acp.PromptResponse{}, fmt.Errorf("coordinate repository prompt: %w", err)
-	}
-	defer func() {
-		if err := unlock(); err != nil {
-			slog.Warn("unlock repository prompt failed", "sessionId", sid, "error", err)
-		}
-	}()
 
 	if sess.IsClosed() {
 		return acp.PromptResponse{}, fmt.Errorf("session %s is closed", sid)
