@@ -1263,3 +1263,90 @@ func TestAgyAgent_Prompt_FlushesUnsentTailAtTurnCompletion(t *testing.T) {
 		t.Fatalf("expected streamed chunk %q, got %#v", runner.streamed, emittedChunks)
 	}
 }
+
+type concurrentTestRunner struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *concurrentTestRunner) Execute(ctx context.Context, opts agy.ExecuteOpts) (*agy.Response, error) {
+	return b.ExecuteStream(ctx, opts, nil)
+}
+
+func (b *concurrentTestRunner) ExecuteStream(ctx context.Context, opts agy.ExecuteOpts, onEvent func(agy.StreamEvent)) (*agy.Response, error) {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-b.release:
+		return &agy.Response{Output: "done: " + opts.Prompt}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestAgyAgent_ConcurrentPromptsInSameWorkdir(t *testing.T) {
+	agent := newTestAgent(t)
+	sharedWorkdir := t.TempDir()
+
+	sess1, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: sharedWorkdir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess2, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: sharedWorkdir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &concurrentTestRunner{
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	agent.runner = runner
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	errCh := make(chan error, 2)
+
+	go func() {
+		defer wg.Done()
+		_, pErr := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: sess1.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("prompt 1")},
+		})
+		errCh <- pErr
+	}()
+
+	// Wait until prompt 1 is running inside runner
+	<-runner.started
+
+	// Prompt 2 starts in the same workdir while prompt 1 is in-flight
+	go func() {
+		defer wg.Done()
+		_, pErr := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: sess2.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("prompt 2")},
+		})
+		errCh <- pErr
+	}()
+
+	// Wait until prompt 2 is also running inside runner
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt 2 was blocked and did not start concurrently in the same workdir")
+	}
+
+	// Release both
+	close(runner.release)
+	wg.Wait()
+	close(errCh)
+
+	for pErr := range errCh {
+		if pErr != nil {
+			t.Fatalf("prompt error: %v", pErr)
+		}
+	}
+}
+
