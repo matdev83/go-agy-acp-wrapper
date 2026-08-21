@@ -101,6 +101,27 @@ func TestStrictModelCatalogRejectsDiscoveryFailure(t *testing.T) {
 	}
 }
 
+func TestModelCatalogRetryAfterTransientFailure(t *testing.T) {
+	script := writeModelsScript(t, "gemini-3.6-flash-high\n")
+	catalog := NewStrictModelCatalog(script)
+
+	// First attempt with already-cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := catalog.EnsureLoaded(ctx); err == nil {
+		t.Fatal("expected cancelled context to fail EnsureLoaded")
+	}
+
+	// Second attempt with valid context should retry and succeed
+	if err := catalog.EnsureLoaded(context.Background()); err != nil {
+		t.Fatalf("expected second EnsureLoaded to succeed, got: %v", err)
+	}
+	if got := catalog.DefaultModelID(); got != "google/gemini-3.6-flash" {
+		t.Fatalf("expected default model 'google/gemini-3.6-flash', got %q", got)
+	}
+}
+
+
 func writeModelsScript(t *testing.T, output string) string {
 	t.Helper()
 	dir := t.TempDir()
