@@ -36,7 +36,7 @@ type ModelCatalog struct {
 	allowFallback bool
 
 	mu           sync.RWMutex
-	once         sync.Once
+	loadMu       sync.Mutex
 	loaded       bool
 	profiles     []ModelProfile
 	byID         map[string]ModelProfile
@@ -67,27 +67,30 @@ func NewStrictModelCatalog(binary string) *ModelCatalog {
 func NewModelCatalogFromIDs(ids ...string) *ModelCatalog {
 	c := &ModelCatalog{binary: "test"}
 	c.setProfiles(normalizeModelIDs(ids))
-	c.once.Do(func() {})
 	return c
 }
 
-// EnsureLoaded discovers models once. Cancellation is returned rather than
-// cached as a fallback so a later call can build a fresh catalog instance.
+// EnsureLoaded discovers models. Cancellation or error is returned rather than
+// permanently cached so a later call can retry loading.
 func (c *ModelCatalog) EnsureLoaded(ctx context.Context) error {
-	var loadErr error
-	c.once.Do(func() {
-		loadErr = c.load(ctx)
-	})
-	if loadErr != nil {
-		return loadErr
-	}
 	c.mu.RLock()
-	loaded := c.loaded
-	c.mu.RUnlock()
-	if !loaded {
-		return fmt.Errorf("model catalog was not loaded")
+	if c.loaded {
+		c.mu.RUnlock()
+		return nil
 	}
-	return nil
+	c.mu.RUnlock()
+
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+
+	c.mu.RLock()
+	if c.loaded {
+		c.mu.RUnlock()
+		return nil
+	}
+	c.mu.RUnlock()
+
+	return c.load(ctx)
 }
 
 func (c *ModelCatalog) load(ctx context.Context) error {
