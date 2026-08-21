@@ -45,6 +45,12 @@ type ModelCatalog struct {
 }
 
 var fallbackModelIDs = []string{
+	"gemini-3.7-flash-high",
+	"gemini-3.7-flash-medium",
+	"gemini-3.7-flash-low",
+	"gemini-3.6-flash-high",
+	"gemini-3.6-flash-medium",
+	"gemini-3.6-flash-low",
 	"gemini-3.5-flash-high",
 	"gemini-3.5-flash-medium",
 	"gemini-3.5-flash-low",
@@ -263,11 +269,19 @@ func discoverModelIDs(ctx context.Context, binary string) ([]string, error) {
 	seen := make(map[string]struct{})
 	ids := make([]string, 0)
 	for line := range strings.Lines(stdout.String()) {
-		id := strings.TrimSpace(line)
-		if id == "" || strings.ContainsAny(id, " \t") {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		id := fields[0]
 		if _, ok := seen[id]; ok {
+			continue
+		}
+		if _, _, _, _, ok := parseNativeModelID(id); !ok {
 			continue
 		}
 		seen[id] = struct{}{}
@@ -433,7 +447,7 @@ func pickDefaultEffort(native map[string]string) string {
 }
 
 func pickDefaultModel(profiles []ModelProfile) string {
-	for _, preferred := range []string{"google/gemini-3.6-flash", "google/gemini-3.5-flash"} {
+	for _, preferred := range []string{"google/gemini-3.7-flash", "google/gemini-3.6-flash", "google/gemini-3.5-flash"} {
 		for _, profile := range profiles {
 			if profile.CanonicalID == preferred {
 				return preferred

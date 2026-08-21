@@ -86,7 +86,7 @@ func TestModelCatalogFallback(t *testing.T) {
 	if err := catalog.EnsureLoaded(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := catalog.DefaultModelID(); got != "google/gemini-3.5-flash" {
+	if got := catalog.DefaultModelID(); got != "google/gemini-3.7-flash" {
 		t.Fatalf("fallback default = %q", got)
 	}
 }
@@ -155,3 +155,24 @@ func overwriteFailingScript(path string) error {
 	}
 	return os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0755)
 }
+
+func TestModelCatalogDiscoverTSVWithPreamble(t *testing.T) {
+	output := "Fetching available models...\ngemini-3.7-flash-high\tGemini 3.7 Flash (High)\ngemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)\nclaude-sonnet-4-6\tClaude Sonnet 4.6\n"
+	script := writeModelsScript(t, output)
+	catalog := NewStrictModelCatalog(script)
+	if err := catalog.EnsureLoaded(context.Background()); err != nil {
+		t.Fatalf("EnsureLoaded failed on TSV with preamble: %v", err)
+	}
+	models := catalog.Models()
+	if len(models) != 2 {
+		t.Fatalf("expected 2 canonical models, got %d: %#v", len(models), models)
+	}
+	if got := catalog.DefaultModelID(); got != "google/gemini-3.7-flash" {
+		t.Fatalf("expected default model google/gemini-3.7-flash, got %q", got)
+	}
+	if got, err := catalog.ResolveNative("google/gemini-3.7-flash", "high"); err != nil || got != "gemini-3.7-flash-high" {
+		t.Fatalf("ResolveNative(google/gemini-3.7-flash, high) = %q, %v", got, err)
+	}
+}
+
+
