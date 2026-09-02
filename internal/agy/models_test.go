@@ -138,11 +138,14 @@ func writeModelsScript(t *testing.T, output string) string {
 		return path
 	}
 	path := filepath.Join(dir, "agy-models.sh")
-	content := "#!/bin/sh\n"
-	for _, line := range lines {
-		content += "echo " + line + "\n"
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\ncat <<'EOF'\n")
+	if output != "" {
+		b.WriteString(strings.TrimSuffix(output, "\n"))
+		b.WriteString("\n")
 	}
-	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+	b.WriteString("EOF\n")
+	if err := os.WriteFile(path, []byte(b.String()), 0755); err != nil {
 		t.Fatal(err)
 	}
 	return path
