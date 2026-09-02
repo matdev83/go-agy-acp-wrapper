@@ -194,7 +194,7 @@ with category `"model"`. Clients can switch models by calling `session/set_confi
 Unknown model values and unsupported reasoning efforts return an error from
 `session/set_config_option`. If `AGY_MODEL` is set to an unknown value, the wrapper
 logs a warning and falls back to the catalog default (preferring
-`google/gemini-3.6-flash`, then `google/gemini-3.5-flash`).
+`google/gemini-3.8-flash`, then `google/gemini-3.7-flash`, then `google/gemini-3.6-flash`).
 
 ## Supported ACP Methods
 

@@ -86,7 +86,7 @@ func TestModelCatalogFallback(t *testing.T) {
 	if err := catalog.EnsureLoaded(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := catalog.DefaultModelID(); got != "google/gemini-3.7-flash" {
+	if got := catalog.DefaultModelID(); got != "google/gemini-3.8-flash" {
 		t.Fatalf("fallback default = %q", got)
 	}
 }
@@ -120,7 +120,6 @@ func TestModelCatalogRetryAfterTransientFailure(t *testing.T) {
 		t.Fatalf("expected default model 'google/gemini-3.6-flash', got %q", got)
 	}
 }
-
 
 func writeModelsScript(t *testing.T, output string) string {
 	t.Helper()
@@ -175,4 +174,28 @@ func TestModelCatalogDiscoverTSVWithPreamble(t *testing.T) {
 	}
 }
 
-
+func TestModelCatalogDiscoverGemini38Flash(t *testing.T) {
+	output := "Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+	script := writeModelsScript(t, output)
+	catalog := NewStrictModelCatalog(script)
+	if err := catalog.EnsureLoaded(context.Background()); err != nil {
+		t.Fatalf("EnsureLoaded failed: %v", err)
+	}
+	models := catalog.Models()
+	if len(models) != 1 {
+		t.Fatalf("expected 1 canonical model, got %d: %#v", len(models), models)
+	}
+	if got := catalog.DefaultModelID(); got != "google/gemini-3.8-flash" {
+		t.Fatalf("expected default model google/gemini-3.8-flash, got %q", got)
+	}
+	for _, effort := range []string{"low", "medium", "high"} {
+		want := "gemini-3.8-flash-" + effort
+		if got, err := catalog.ResolveNative("google/gemini-3.8-flash", effort); err != nil || got != want {
+			t.Fatalf("ResolveNative(google/gemini-3.8-flash, %s) = %q, %v", effort, got, err)
+		}
+	}
+	efforts := catalog.SupportedEfforts("google/gemini-3.8-flash")
+	if len(efforts) != 3 {
+		t.Fatalf("expected 3 supported efforts, got %#v", efforts)
+	}
+}
